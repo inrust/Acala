@@ -4,12 +4,12 @@
 
 use super::*;
 use frame_support::{impl_outer_dispatch, impl_outer_origin, ord_parameter_types, parameter_types};
-use frame_system::EnsureSignedBy;
+use frame_system::{EnsureRoot, EnsureSignedBy};
 use orml_oracle::DefaultCombineData;
 use primitives::{Amount, Balance, CurrencyId};
 use sp_runtime::{
-	testing::{Header, TestXt, UintAuthorityId},
-	traits::IdentityLookup,
+	testing::{Header, TestXt},
+	traits::{Convert, IdentityLookup},
 	ModuleId,
 };
 use sp_std::vec;
@@ -28,7 +28,7 @@ impl_outer_origin! {
 
 pub type AccountIndex = u32;
 pub type AccountId = u128;
-pub type AuctionId = u64;
+pub type AuctionId = u32;
 pub type BlockNumber = u64;
 
 pub const ACA: CurrencyId = CurrencyId::ACA;
@@ -64,6 +64,7 @@ impl frame_system::Trait for Runtime {
 	type ExtrinsicBaseWeight = ();
 	type MaximumExtrinsicWeight = ();
 	type BaseCallFilter = ();
+	type SystemWeightInfo = ();
 }
 
 impl orml_tokens::Trait for Runtime {
@@ -72,6 +73,7 @@ impl orml_tokens::Trait for Runtime {
 	type Amount = Amount;
 	type CurrencyId = CurrencyId;
 	type OnReceived = ();
+	type WeightInfo = ();
 }
 pub type Tokens = orml_tokens::Module<Runtime>;
 
@@ -85,6 +87,7 @@ impl pallet_balances::Trait for Runtime {
 	type Event = ();
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = frame_system::Module<Runtime>;
+	type WeightInfo = ();
 }
 pub type PalletBalances = pallet_balances::Module<Runtime>;
 
@@ -100,6 +103,7 @@ impl orml_currencies::Trait for Runtime {
 	type MultiCurrency = Tokens;
 	type NativeCurrency = AdaptedBasicCurrency;
 	type GetNativeCurrencyId = GetNativeCurrencyId;
+	type WeightInfo = ();
 }
 pub type Currencies = orml_currencies::Module<Runtime>;
 
@@ -108,6 +112,7 @@ impl orml_auction::Trait for Runtime {
 	type Balance = Balance;
 	type AuctionId = AuctionId;
 	type Handler = AuctionManagerModule;
+	type WeightInfo = ();
 }
 pub type AuctionModule = orml_auction::Module<Runtime>;
 
@@ -116,7 +121,6 @@ parameter_types! {
 	pub const AuctionTimeToClose: u64 = 100;
 	pub const AuctionDurationSoftCap: u64 = 2000;
 	pub const GetStableCurrencyId: CurrencyId = AUSD;
-	pub GetAmountAdjustment: Rate = Rate::saturating_from_rational(1, 2);
 	pub const UnsignedPriority: u64 = 1 << 20;
 }
 
@@ -130,10 +134,10 @@ impl auction_manager::Trait for Runtime {
 	type GetStableCurrencyId = GetStableCurrencyId;
 	type GetNativeCurrencyId = GetNativeCurrencyId;
 	type CDPTreasury = CDPTreasuryModule;
-	type GetAmountAdjustment = GetAmountAdjustment;
 	type DEX = ();
 	type PriceSource = prices::Module<Runtime>;
 	type UnsignedPriority = UnsignedPriority;
+	type EmergencyShutdown = EmergencyShutdownModule;
 }
 pub type AuctionManagerModule = auction_manager::Module<Runtime>;
 
@@ -177,24 +181,25 @@ impl pallet_timestamp::Trait for Runtime {
 	type Moment = u64;
 	type OnTimestampSet = ();
 	type MinimumPeriod = MinimumPeriod;
+	type WeightInfo = ();
 }
 
 parameter_types! {
 	pub const MinimumCount: u32 = 1;
 	pub const ExpiresIn: u32 = 1000 * 60 * 30; // 30 mins
+	pub const RootOperatorAccountId: AccountId = 1;
 }
 
-impl orml_oracle::Trait for Runtime {
+impl orml_oracle::Trait<orml_oracle::Instance1> for Runtime {
 	type Event = ();
 	type OnNewData = ();
-	type CombineData = DefaultCombineData<Self, MinimumCount, ExpiresIn>;
+	type CombineData = DefaultCombineData<Self, MinimumCount, ExpiresIn, orml_oracle::Instance1>;
 	type Time = pallet_timestamp::Module<Self>;
 	type OracleKey = CurrencyId;
 	type OracleValue = Price;
-	type UnsignedPriority = UnsignedPriority;
-	type AuthorityId = UintAuthorityId;
+	type RootOperatorAccountId = RootOperatorAccountId;
 }
-pub type ModuleOracle = orml_oracle::Module<Runtime>;
+pub type ModuleOracle = orml_oracle::Module<Runtime, orml_oracle::Instance1>;
 
 pub struct MockLiquidStakingExchangeProvider;
 impl ExchangeRateProvider for MockLiquidStakingExchangeProvider {
@@ -211,7 +216,7 @@ parameter_types! {
 
 impl prices::Trait for Runtime {
 	type Event = ();
-	type Source = orml_oracle::Module<Runtime>;
+	type Source = orml_oracle::Module<Runtime, orml_oracle::Instance1>;
 	type GetStableCurrencyId = GetStableCurrencyId;
 	type StableCurrencyFixedPrice = StableCurrencyFixedPrice;
 	type GetStakingCurrencyId = GetStakingCurrencyId;
@@ -220,6 +225,40 @@ impl prices::Trait for Runtime {
 	type LiquidStakingExchangeRateProvider = MockLiquidStakingExchangeProvider;
 }
 
+pub struct MockConvert;
+impl Convert<(CurrencyId, Balance), Balance> for MockConvert {
+	fn convert(a: (CurrencyId, Balance)) -> Balance {
+		a.1.into()
+	}
+}
+
+parameter_types! {
+	pub const LoansModuleId: ModuleId = ModuleId(*b"aca/loan");
+}
+
+impl loans::Trait for Runtime {
+	type Event = ();
+	type Convert = MockConvert;
+	type Currency = Tokens;
+	type RiskManager = ();
+	type CDPTreasury = CDPTreasuryModule;
+	type ModuleId = LoansModuleId;
+}
+
+parameter_types! {
+	pub CollateralCurrencyIds: Vec<CurrencyId> = vec![CurrencyId::XBTC, CurrencyId::DOT];
+}
+
+impl emergency_shutdown::Trait for Runtime {
+	type Event = ();
+	type CollateralCurrencyIds = CollateralCurrencyIds;
+	type PriceSource = prices::Module<Runtime>;
+	type CDPTreasury = CDPTreasuryModule;
+	type AuctionManagerHandler = AuctionManagerModule;
+	type ShutdownOrigin = EnsureRoot<AccountId>;
+}
+pub type EmergencyShutdownModule = emergency_shutdown::Module<Runtime>;
+
 impl crate::Trait for Runtime {}
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
@@ -227,9 +266,9 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 		.build_storage::<Runtime>()
 		.unwrap();
 
-	let _ = orml_oracle::GenesisConfig::<Runtime> {
+	let _ = orml_oracle::GenesisConfig::<Runtime, orml_oracle::Instance1> {
 		members: vec![1, 2, 3].into(),
-		session_keys: vec![(1, 10.into()), (2, 20.into()), (3, 30.into())],
+		phantom: Default::default(),
 	}
 	.assimilate_storage(&mut storage);
 

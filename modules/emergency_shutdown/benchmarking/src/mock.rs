@@ -28,10 +28,8 @@ impl_outer_origin! {
 
 pub type AccountIndex = u32;
 pub type AccountId = u128;
-pub type AuctionId = u64;
+pub type AuctionId = u32;
 pub type BlockNumber = u64;
-pub type DebitBalance = Balance;
-pub type DebitAmount = Amount;
 
 pub const ACA: CurrencyId = CurrencyId::ACA;
 pub const AUSD: CurrencyId = CurrencyId::AUSD;
@@ -115,8 +113,6 @@ impl loans::Trait for Runtime {
 	type Convert = cdp_engine::DebitExchangeRateConvertor<Runtime>;
 	type Currency = Currencies;
 	type RiskManager = CDPEngineModule;
-	type DebitBalance = DebitBalance;
-	type DebitAmount = DebitAmount;
 	type CDPTreasury = CDPTreasuryModule;
 	type ModuleId = LoansModuleId;
 }
@@ -132,12 +128,17 @@ impl AuctionManager<AccountId> for MockAuctionManager {
 		_currency_id: Self::CurrencyId,
 		_amount: Self::Balance,
 		_target: Self::Balance,
-	) {
+	) -> DispatchResult {
+		Ok(())
 	}
 
-	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) {}
+	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) -> DispatchResult {
+		Ok(())
+	}
 
-	fn new_surplus_auction(_amount: Self::Balance) {}
+	fn new_surplus_auction(_amount: Self::Balance) -> DispatchResult {
+		Ok(())
+	}
 
 	fn cancel_auction(_id: Self::AuctionId) -> DispatchResult {
 		Ok(())

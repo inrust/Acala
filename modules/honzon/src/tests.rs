@@ -4,10 +4,7 @@
 
 use super::*;
 use frame_support::{assert_noop, assert_ok};
-use mock::{
-	CDPEngineModule, ExtBuilder, HonzonModule, LoansModule, Origin, Runtime, System, TestEvent, ALICE, BOB, BTC, CAROL,
-	DOT,
-};
+use mock::*;
 use orml_traits::Change;
 use sp_runtime::FixedPointNumber;
 use support::{Rate, Ratio};
@@ -86,8 +83,8 @@ fn transfer_loan_from_should_work() {
 		assert_ok!(HonzonModule::adjust_loan(Origin::signed(ALICE), BTC, 100, 50));
 		assert_ok!(HonzonModule::authorize(Origin::signed(ALICE), BTC, BOB));
 		assert_ok!(HonzonModule::transfer_loan_from(Origin::signed(BOB), BTC, ALICE));
-		assert_eq!(LoansModule::collaterals(BOB, BTC), 100);
-		assert_eq!(LoansModule::debits(BTC, BOB), 50);
+		assert_eq!(LoansModule::positions(BTC, BOB).collateral, 100);
+		assert_eq!(LoansModule::positions(BTC, BOB).debit, 50);
 	});
 }
 
@@ -114,17 +111,15 @@ fn adjust_loan_should_work() {
 			Change::NewValue(10000),
 		));
 		assert_ok!(HonzonModule::adjust_loan(Origin::signed(ALICE), BTC, 100, 50));
-		assert_eq!(LoansModule::collaterals(ALICE, BTC), 100);
-		assert_eq!(LoansModule::debits(BTC, ALICE), 50);
+		assert_eq!(LoansModule::positions(BTC, ALICE).collateral, 100);
+		assert_eq!(LoansModule::positions(BTC, ALICE).debit, 50);
 	});
 }
 
 #[test]
 fn on_emergency_shutdown_should_work() {
 	ExtBuilder::default().build().execute_with(|| {
-		assert_eq!(HonzonModule::is_shutdown(), false);
-		HonzonModule::on_emergency_shutdown();
-		assert_eq!(HonzonModule::is_shutdown(), true);
+		mock_shutdown();
 		assert_noop!(
 			HonzonModule::adjust_loan(Origin::signed(ALICE), BTC, 100, 50),
 			Error::<Runtime>::AlreadyShutdown,

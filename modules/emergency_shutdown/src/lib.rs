@@ -2,12 +2,14 @@
 //!
 //! ## Overview
 //!
-//! When a black swan occurs such as price plunge or fatal bug, the highest priority is
-//! to minimize user losses as much as possible. When the decision to shutdown system is made,
-//! emergency shutdown module needs to trigger all related module to halt, and start a series of
-//! operations including close some user entry, freeze feed prices, run offchain worker to settle
-//! CDPs has debit, cancel all active auctions module, when debits and gaps are settled,
-//! the stable coin holder are allowed to refund a basket of remaining collateral assets.
+//! When a black swan occurs such as price plunge or fatal bug, the highest
+//! priority is to minimize user losses as much as possible. When the decision
+//! to shutdown system is made, emergency shutdown module needs to trigger all
+//! related module to halt, and start a series of operations including close
+//! some user entry, freeze feed prices, run offchain worker to settle
+//! CDPs has debit, cancel all active auctions module, when debits and gaps are
+//! settled, the stable currency holder are allowed to refund a basket of
+//! remaining collateral assets.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -21,7 +23,7 @@ use orml_utilities::with_transaction_result;
 use primitives::{Balance, CurrencyId};
 use sp_runtime::{traits::Zero, FixedPointNumber};
 use sp_std::prelude::*;
-use support::{AuctionManager, CDPTreasury, OnEmergencyShutdown, PriceProvider, Ratio};
+use support::{AuctionManager, CDPTreasury, EmergencyShutdown, PriceProvider, Ratio};
 
 mod mock;
 mod tests;
@@ -38,13 +40,12 @@ pub trait Trait: system::Trait + loans::Trait {
 	/// CDP treasury to escrow collateral assets after settlement
 	type CDPTreasury: CDPTreasury<Self::AccountId, Balance = Balance, CurrencyId = CurrencyId>;
 
-	/// Check the auction cancellation to decide whether to open the final redemption
+	/// Check the auction cancellation to decide whether to open the final
+	/// redemption
 	type AuctionManagerHandler: AuctionManager<Self::AccountId, Balance = Balance, CurrencyId = CurrencyId>;
 
-	/// Handler to trigger other operations
-	type OnShutdown: OnEmergencyShutdown;
-
-	/// The origin which may trigger emergency shutdown. Root can always do this.
+	/// The origin which may trigger emergency shutdown. Root can always do
+	/// this.
 	type ShutdownOrigin: EnsureOrigin<Self::Origin>;
 }
 
@@ -71,12 +72,12 @@ decl_error! {
 		AlreadyShutdown,
 		/// Must after system shutdown
 		MustAfterShutdown,
-		/// Final redeption is still not opened
+		/// Final redemption is still not opened
 		CanNotRefund,
-		/// Exist optential surplus, means settlement has not been completed
+		/// Exist potential surplus, means settlement has not been completed
 		ExistPotentialSurplus,
 		/// Exist unhandled debit, means settlement has not been completed
-		ExistUnhandleDebit,
+		ExistUnhandledDebit,
 	}
 }
 
@@ -110,10 +111,10 @@ decl_module! {
 		/// - Db reads: `IsShutdown`, (length of collateral_ids) items in modules related to module_emergency_shutdown
 		/// - Db writes: `IsShutdown`, (4 + length of collateral_ids) items in modules related to module_emergency_shutdown
 		/// -------------------
-		/// Base Weight: 47.4 µs
+		/// Base Weight: 148.3 µs
 		/// # </weight>
 		#[weight = (
-			48 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(
+			148 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(
 				1 + (T::CollateralCurrencyIds::get().len() as u64),
 				5 + (T::CollateralCurrencyIds::get().len() as u64),
 			),
@@ -123,9 +124,6 @@ decl_module! {
 			with_transaction_result(|| {
 				T::ShutdownOrigin::ensure_origin(origin)?;
 				ensure!(!Self::is_shutdown(), Error::<T>::AlreadyShutdown);
-
-				// trigger shutdown in other related modules
-				T::OnShutdown::on_emergency_shutdown();
 
 				// get all collateral types
 				let collateral_currency_ids = T::CollateralCurrencyIds::get();
@@ -154,10 +152,10 @@ decl_module! {
 		/// - Db reads: `IsShutdown`, (2 + 2 * length of collateral_ids) items in modules related to module_emergency_shutdown
 		/// - Db writes: `CanRefund`
 		/// -------------------
-		/// Base Weight: 47.4 µs
+		/// Base Weight: 71.8 µs
 		/// # </weight>
 		#[weight = (
-			48 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(
+			72 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(
 				2 + 2 * (T::CollateralCurrencyIds::get().len() as u64),
 				1,
 			),
@@ -168,7 +166,7 @@ decl_module! {
 				T::ShutdownOrigin::ensure_origin(origin)?;
 				ensure!(Self::is_shutdown(), Error::<T>::MustAfterShutdown);	// must after shutdown
 
-				// Ensure there's no debit and surplus auction now, these maybe bring uncertain surplus to system.
+				// Ensure there's no debit and surplus auction now, they may bring uncertain surplus to system.
 				// Cancel all surplus auctions and debit auctions to pass the check!
 				ensure!(
 					<T as Trait>::AuctionManagerHandler::get_total_debit_in_auction().is_zero()
@@ -181,15 +179,15 @@ decl_module! {
 				// wait for all collateral auctions in reverse stage to be ended.
 				let collateral_currency_ids = T::CollateralCurrencyIds::get();
 				for currency_id in collateral_currency_ids {
-					// these's no collateral auction
+					// there's no collateral auction
 					ensure!(
 						<T as Trait>::AuctionManagerHandler::get_total_collateral_in_auction(currency_id).is_zero(),
 						Error::<T>::ExistPotentialSurplus,
 					);
-					// there's on debit in cdp
+					// there's on debit in CDP
 					ensure!(
-						<loans::Module<T>>::total_debits(currency_id).is_zero(),
-						Error::<T>::ExistUnhandleDebit,
+						<loans::Module<T>>::total_positions(currency_id).debit.is_zero(),
+						Error::<T>::ExistUnhandledDebit,
 					);
 				}
 
@@ -202,7 +200,7 @@ decl_module! {
 
 		/// Refund a basket of remaining collateral assets to caller
 		///
-		/// - `amount`: stable coin amount used to refund.
+		/// - `amount`: stable currency amount used to refund.
 		///
 		/// # <weight>
 		/// - Preconditions:
@@ -213,9 +211,9 @@ decl_module! {
 		/// - Db reads: `CanRefund`, (2 + 3 * length of collateral_ids) items in modules related to module_emergency_shutdown
 		/// - Db writes: (3 * length of collateral_ids) items in modules related to module_emergency_shutdown
 		/// -------------------
-		/// Base Weight: 95.86 µs
+		/// Base Weight: 455.1 µs
 		/// # </weight>
-		#[weight = 96 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(
+		#[weight = 455 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(
 			3 + 3 * (T::CollateralCurrencyIds::get().len() as u64),
 			3 * (T::CollateralCurrencyIds::get().len() as u64)
 		)]
@@ -227,11 +225,11 @@ decl_module! {
 				let refund_ratio: Ratio = <T as Trait>::CDPTreasury::get_debit_proportion(amount);
 				let collateral_currency_ids = T::CollateralCurrencyIds::get();
 
-				// burn caller's stable currency by cdp treasury
+				// burn caller's stable currency by CDP treasury
 				<T as Trait>::CDPTreasury::burn_debit(&who, amount)?;
 
 				let mut refund_assets: Vec<(CurrencyId, Balance)> = vec![];
-				// refund collaterals to caller by cdp treasury
+				// refund collaterals to caller by CDP treasury
 				for currency_id in collateral_currency_ids {
 					let refund_amount = refund_ratio
 						.saturating_mul_int(<T as Trait>::CDPTreasury::get_total_collaterals(currency_id));
@@ -246,5 +244,11 @@ decl_module! {
 				Ok(())
 			})?;
 		}
+	}
+}
+
+impl<T: Trait> EmergencyShutdown for Module<T> {
+	fn is_shutdown() -> bool {
+		Self::is_shutdown()
 	}
 }

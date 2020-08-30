@@ -5,6 +5,7 @@
 use super::*;
 use frame_support::{impl_outer_event, impl_outer_origin, ord_parameter_types, parameter_types};
 use frame_system::EnsureSignedBy;
+use orml_traits::DataFeeder;
 use sp_core::H256;
 use sp_runtime::{testing::Header, traits::IdentityLookup, FixedPointNumber, Perbill};
 use support::ExchangeRate;
@@ -27,7 +28,7 @@ mod prices {
 
 impl_outer_event! {
 	pub enum TestEvent for Runtime {
-		system<T>,
+		frame_system<T>,
 		prices,
 	}
 }
@@ -43,7 +44,7 @@ parameter_types! {
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
 
-impl system::Trait for Runtime {
+impl frame_system::Trait for Runtime {
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = BlockNumber;
@@ -68,8 +69,9 @@ impl system::Trait for Runtime {
 	type ExtrinsicBaseWeight = ();
 	type MaximumExtrinsicWeight = ();
 	type BaseCallFilter = ();
+	type SystemWeightInfo = ();
 }
-pub type System = system::Module<Runtime>;
+pub type System = frame_system::Module<Runtime>;
 
 pub struct MockDataProvider;
 impl DataProvider<CurrencyId, Price> for MockDataProvider {
@@ -84,7 +86,7 @@ impl DataProvider<CurrencyId, Price> for MockDataProvider {
 	}
 }
 
-impl DataProviderExtended<CurrencyId, Price, AccountId> for MockDataProvider {
+impl DataFeeder<CurrencyId, Price, AccountId> for MockDataProvider {
 	fn feed_value(_: AccountId, _: CurrencyId, _: Price) -> sp_runtime::DispatchResult {
 		Ok(())
 	}
@@ -130,7 +132,9 @@ impl Default for ExtBuilder {
 
 impl ExtBuilder {
 	pub fn build(self) -> sp_io::TestExternalities {
-		let t = system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
+		let t = frame_system::GenesisConfig::default()
+			.build_storage::<Runtime>()
+			.unwrap();
 
 		t.into()
 	}

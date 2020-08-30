@@ -4,12 +4,12 @@
 
 use super::*;
 use frame_support::{impl_outer_dispatch, impl_outer_origin, ord_parameter_types, parameter_types};
-use frame_system::EnsureSignedBy;
+use frame_system::{EnsureRoot, EnsureSignedBy};
 use orml_oracle::DefaultCombineData;
 use primitives::{Amount, Balance, CurrencyId};
 use sp_runtime::{
 	testing::{Header, TestXt, UintAuthorityId},
-	traits::IdentityLookup,
+	traits::{Convert, IdentityLookup},
 	DispatchResult, FixedPointNumber, ModuleId,
 };
 use sp_std::vec;
@@ -28,11 +28,9 @@ impl_outer_origin! {
 
 pub type AccountIndex = u32;
 pub type AccountId = u128;
-pub type AuctionId = u64;
+pub type AuctionId = u32;
 pub type BlockNumber = u64;
 pub type Share = u64;
-pub type DebitBalance = Balance;
-pub type DebitAmount = Amount;
 
 pub const ACA: CurrencyId = CurrencyId::ACA;
 pub const AUSD: CurrencyId = CurrencyId::AUSD;
@@ -116,8 +114,6 @@ impl loans::Trait for Runtime {
 	type Convert = cdp_engine::DebitExchangeRateConvertor<Runtime>;
 	type Currency = Tokens;
 	type RiskManager = CDPEngineModule;
-	type DebitBalance = DebitBalance;
-	type DebitAmount = DebitAmount;
 	type CDPTreasury = CDPTreasuryModule;
 	type ModuleId = LoansModuleId;
 }
@@ -133,12 +129,17 @@ impl AuctionManager<AccountId> for MockAuctionManager {
 		_currency_id: Self::CurrencyId,
 		_amount: Self::Balance,
 		_target: Self::Balance,
-	) {
+	) -> DispatchResult {
+		Ok(())
 	}
 
-	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) {}
+	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) -> DispatchResult {
+		Ok(())
+	}
 
-	fn new_surplus_auction(_amount: Self::Balance) {}
+	fn new_surplus_auction(_amount: Self::Balance) -> DispatchResult {
+		Ok(())
+	}
 
 	fn cancel_auction(_id: Self::AuctionId) -> DispatchResult {
 		Ok(())
@@ -290,6 +291,27 @@ impl prices::Trait for Runtime {
 	type LockOrigin = EnsureSignedBy<One, AccountId>;
 	type LiquidStakingExchangeRateProvider = MockLiquidStakingExchangeProvider;
 }
+
+pub struct MockConvert;
+impl Convert<(CurrencyId, Balance), Balance> for MockConvert {
+	fn convert(a: (CurrencyId, Balance)) -> Balance {
+		a.1.into()
+	}
+}
+
+parameter_types! {
+	pub CollateralCurrencyIds: Vec<CurrencyId> = vec![CurrencyId::XBTC, CurrencyId::DOT];
+}
+
+impl emergency_shutdown::Trait for Runtime {
+	type Event = ();
+	type CollateralCurrencyIds = CollateralCurrencyIds;
+	type PriceSource = prices::Module<Runtime>;
+	type CDPTreasury = CDPTreasuryModule;
+	type AuctionManagerHandler = AuctionManagerModule;
+	type ShutdownOrigin = EnsureRoot<AccountId>;
+}
+pub type EmergencyShutdownModule = emergency_shutdown::Module<Runtime>;
 
 impl crate::Trait for Runtime {}
 

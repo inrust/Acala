@@ -15,10 +15,8 @@ use sp_runtime::{
 use support::{AuctionManager, Price, PriceProvider};
 
 pub type AccountId = u128;
-pub type AuctionId = u64;
+pub type AuctionId = u32;
 pub type BlockNumber = u64;
-pub type DebitBalance = Balance;
-pub type DebitAmount = Amount;
 
 pub const ALICE: AccountId = 1;
 pub const BOB: AccountId = 2;
@@ -36,7 +34,7 @@ mod emergency_shutdown {
 
 impl_outer_event! {
 	pub enum TestEvent for Runtime {
-		system<T>,
+		frame_system<T>,
 		emergency_shutdown<T>,
 		orml_tokens<T>,
 		loans<T>,
@@ -57,7 +55,7 @@ parameter_types! {
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
 
-impl system::Trait for Runtime {
+impl frame_system::Trait for Runtime {
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = BlockNumber;
@@ -82,8 +80,9 @@ impl system::Trait for Runtime {
 	type ExtrinsicBaseWeight = ();
 	type MaximumExtrinsicWeight = ();
 	type BaseCallFilter = ();
+	type SystemWeightInfo = ();
 }
-pub type System = system::Module<Runtime>;
+pub type System = frame_system::Module<Runtime>;
 
 impl orml_tokens::Trait for Runtime {
 	type Event = TestEvent;
@@ -91,6 +90,7 @@ impl orml_tokens::Trait for Runtime {
 	type Amount = Amount;
 	type CurrencyId = CurrencyId;
 	type OnReceived = ();
+	type WeightInfo = ();
 }
 pub type Tokens = orml_tokens::Module<Runtime>;
 
@@ -103,7 +103,8 @@ impl pallet_balances::Trait for Runtime {
 	type DustRemoval = ();
 	type Event = TestEvent;
 	type ExistentialDeposit = ExistentialDeposit;
-	type AccountStore = system::Module<Runtime>;
+	type AccountStore = frame_system::Module<Runtime>;
+	type WeightInfo = ();
 }
 pub type PalletBalances = pallet_balances::Module<Runtime>;
 pub type AdaptedBasicCurrency =
@@ -118,13 +119,14 @@ impl orml_currencies::Trait for Runtime {
 	type MultiCurrency = Tokens;
 	type NativeCurrency = AdaptedBasicCurrency;
 	type GetNativeCurrencyId = GetNativeCurrencyId;
+	type WeightInfo = ();
 }
 pub type Currencies = orml_currencies::Module<Runtime>;
 
 // mock convert
 pub struct MockConvert;
-impl Convert<(CurrencyId, DebitBalance), Balance> for MockConvert {
-	fn convert(a: (CurrencyId, DebitBalance)) -> Balance {
+impl Convert<(CurrencyId, Balance), Balance> for MockConvert {
+	fn convert(a: (CurrencyId, Balance)) -> Balance {
 		a.1.into()
 	}
 }
@@ -138,8 +140,6 @@ impl loans::Trait for Runtime {
 	type Convert = MockConvert;
 	type Currency = Tokens;
 	type RiskManager = ();
-	type DebitBalance = DebitBalance;
-	type DebitAmount = DebitAmount;
 	type CDPTreasury = CDPTreasuryModule;
 	type ModuleId = LoansModuleId;
 }
@@ -170,12 +170,17 @@ impl AuctionManager<AccountId> for MockAuctionManager {
 		_currency_id: Self::CurrencyId,
 		_amount: Self::Balance,
 		_target: Self::Balance,
-	) {
+	) -> DispatchResult {
+		Ok(())
 	}
 
-	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) {}
+	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) -> DispatchResult {
+		Ok(())
+	}
 
-	fn new_surplus_auction(_amount: Self::Balance) {}
+	fn new_surplus_auction(_amount: Self::Balance) -> DispatchResult {
+		Ok(())
+	}
 
 	fn cancel_auction(_id: Self::AuctionId) -> DispatchResult {
 		Ok(())
@@ -230,7 +235,6 @@ impl Trait for Runtime {
 	type PriceSource = MockPriceSource;
 	type CDPTreasury = CDPTreasuryModule;
 	type AuctionManagerHandler = MockAuctionManager;
-	type OnShutdown = CDPTreasuryModule;
 	type ShutdownOrigin = EnsureSignedBy<One, AccountId>;
 }
 pub type EmergencyShutdownModule = Module<Runtime>;
@@ -254,7 +258,9 @@ impl Default for ExtBuilder {
 
 impl ExtBuilder {
 	pub fn build(self) -> sp_io::TestExternalities {
-		let mut t = system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
+		let mut t = frame_system::GenesisConfig::default()
+			.build_storage::<Runtime>()
+			.unwrap();
 
 		orml_tokens::GenesisConfig::<Runtime> {
 			endowed_accounts: self.endowed_accounts,

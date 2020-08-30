@@ -2,8 +2,8 @@
 //!
 //! ## Overview
 //!
-//! The data from Oracle cannot be used in business, prices module will do some process and feed prices for Acala.
-//! Process include:
+//! The data from Oracle cannot be used in business, prices module will do some
+//! process and feed prices for Acala. Process include:
 //!   - specify a fixed price for stable currency
 //!   - feed price in USD or related price bewteen two currencies
 //!   - lock/unlock the price data get from oracle
@@ -16,7 +16,7 @@ use frame_support::{
 	weights::DispatchClass,
 };
 use frame_system::{self as system};
-use orml_traits::{DataProvider, DataProviderExtended};
+use orml_traits::{DataFeeder, DataProvider};
 use orml_utilities::with_transaction_result;
 use primitives::CurrencyId;
 use sp_runtime::traits::{CheckedDiv, CheckedMul};
@@ -29,7 +29,7 @@ pub trait Trait: system::Trait {
 	type Event: From<Event> + Into<<Self as system::Trait>::Event>;
 
 	/// The data source, such as Oracle.
-	type Source: DataProviderExtended<CurrencyId, Price, Self::AccountId>;
+	type Source: DataProvider<CurrencyId, Price> + DataFeeder<CurrencyId, Price, Self::AccountId>;
 
 	/// The stable currency id, it should be AUSD in Acala.
 	type GetStableCurrencyId: Get<CurrencyId>;
@@ -46,7 +46,8 @@ pub trait Trait: system::Trait {
 	/// The origin which may lock and unlock prices feed to system.
 	type LockOrigin: EnsureOrigin<Self::Origin>;
 
-	/// The provider of the exchange rate between liquid currency and staking currency.
+	/// The provider of the exchange rate between liquid currency and staking
+	/// currency.
 	type LiquidStakingExchangeRateProvider: ExchangeRateProvider;
 }
 
@@ -125,7 +126,8 @@ impl<T: Trait> PriceProvider<CurrencyId> for Module<T> {
 			// if is stable currency, return fixed price
 			Some(T::StableCurrencyFixedPrice::get())
 		} else if currency_id == T::GetLiquidCurrencyId::get() {
-			// if is homa liquid currency, return the product of staking currency price and liquid/staking exchange rate.
+			// if is homa liquid currency, return the product of staking currency price and
+			// liquid/staking exchange rate.
 			Self::get_price(T::GetStakingCurrencyId::get())
 				.and_then(|n| n.checked_mul(&T::LiquidStakingExchangeRateProvider::get_exchange_rate()))
 		} else {

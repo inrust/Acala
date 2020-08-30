@@ -12,18 +12,21 @@ use sp_std::vec;
 use frame_benchmarking::{account, benchmarks};
 use frame_support::traits::Get;
 use frame_system::RawOrigin;
-use sp_runtime::{traits::UniqueSaturatedInto, FixedPointNumber};
+use sp_runtime::{traits::UniqueSaturatedInto, DispatchError, FixedPointNumber};
 
 use cdp_engine::Module as CdpEngine;
 use cdp_engine::*;
 use dex::Module as Dex;
-use orml_traits::{Change, DataProviderExtended, MultiCurrencyExtended};
-use primitives::{Balance, CurrencyId};
-use support::{OnEmergencyShutdown, Price, Rate, Ratio};
+use orml_traits::{Change, DataFeeder, MultiCurrencyExtended};
+use primitives::{Amount, Balance, CurrencyId};
+use support::{Price, Rate, Ratio};
 
 pub struct Module<T: Trait>(cdp_engine::Module<T>);
 
-pub trait Trait: cdp_engine::Trait + orml_oracle::Trait + prices::Trait + dex::Trait {}
+pub trait Trait:
+	cdp_engine::Trait + orml_oracle::Trait<orml_oracle::Instance1> + prices::Trait + dex::Trait + emergency_shutdown::Trait
+{
+}
 
 const SEED: u32 = 0;
 
@@ -33,7 +36,7 @@ fn dollar(d: u32) -> Balance {
 }
 
 fn feed_price<T: Trait>(currency_id: CurrencyId, price: Price) -> Result<(), &'static str> {
-	let oracle_operators = orml_oracle::Module::<T>::members().0;
+	let oracle_operators = orml_oracle::Module::<T, orml_oracle::Instance1>::members().0;
 	for operator in oracle_operators {
 		<T as prices::Trait>::Source::feed_value(operator.clone(), currency_id, price)?;
 	}
@@ -66,6 +69,10 @@ fn inject_liquidity<T: Trait>(
 	Ok(())
 }
 
+fn emergency_shutdown<T: Trait>() -> Result<(), DispatchError> {
+	emergency_shutdown::Module::<T>::emergency_shutdown(RawOrigin::Root.into())
+}
+
 benchmarks! {
 	_ { }
 
@@ -95,7 +102,7 @@ benchmarks! {
 		let debit_exchange_rate = CdpEngine::<T>::get_debit_exchange_rate(currency_id);
 		let collateral_price = Price::one();		// 1 USD
 		let min_debit_amount = debit_exchange_rate.reciprocal().unwrap().saturating_mul_int(min_debit_value);
-		let min_debit_amount: T::DebitAmount = min_debit_amount.unique_saturated_into();
+		let min_debit_amount: Amount = min_debit_amount.unique_saturated_into();
 		let collateral_amount = (min_debit_value * 2).unique_saturated_into();
 
 		// set balance
@@ -141,7 +148,7 @@ benchmarks! {
 		let debit_exchange_rate = CdpEngine::<T>::get_debit_exchange_rate(currency_id);
 		let collateral_price = Price::one();		// 1 USD
 		let min_debit_amount = debit_exchange_rate.reciprocal().unwrap().saturating_mul_int(min_debit_value);
-		let min_debit_amount: T::DebitAmount = min_debit_amount.unique_saturated_into();
+		let min_debit_amount: Amount = min_debit_amount.unique_saturated_into();
 		let collateral_amount = (min_debit_value * 2).unique_saturated_into();
 
 		let max_slippage_swap_with_dex = <T as cdp_engine::Trait>::MaxSlippageSwapWithDEX::get();
@@ -196,7 +203,7 @@ benchmarks! {
 		let debit_exchange_rate = CdpEngine::<T>::get_debit_exchange_rate(currency_id);
 		let collateral_price = Price::one();		// 1 USD
 		let min_debit_amount = debit_exchange_rate.reciprocal().unwrap().saturating_mul_int(min_debit_value);
-		let min_debit_amount: T::DebitAmount = min_debit_amount.unique_saturated_into();
+		let min_debit_amount: Amount = min_debit_amount.unique_saturated_into();
 		let collateral_amount = (min_debit_value * 2).unique_saturated_into();
 
 		// set balance
@@ -220,7 +227,7 @@ benchmarks! {
 		CdpEngine::<T>::adjust_position(&owner, currency_id, collateral_amount, min_debit_amount)?;
 
 		// shutdown
-		CdpEngine::<T>::on_emergency_shutdown();
+		emergency_shutdown::<T>()?;
 	}: _(RawOrigin::None, currency_id, owner)
 }
 

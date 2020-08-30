@@ -7,6 +7,7 @@ use frame_support::{impl_outer_event, impl_outer_origin, parameter_types};
 use primitives::Amount;
 use sp_core::H256;
 use sp_runtime::{testing::Header, traits::IdentityLookup, Perbill};
+use sp_std::cell::RefCell;
 use support::PolkadotStakingLedger;
 
 pub type AccountId = u128;
@@ -32,7 +33,7 @@ impl_outer_origin! {
 
 impl_outer_event! {
 	pub enum TestEvent for Runtime {
-		system<T>,
+		frame_system<T>,
 		staking_pool<T>,
 		orml_tokens<T>,
 		pallet_balances<T>,
@@ -47,7 +48,7 @@ parameter_types! {
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
 
-impl system::Trait for Runtime {
+impl frame_system::Trait for Runtime {
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = BlockNumber;
@@ -72,8 +73,9 @@ impl system::Trait for Runtime {
 	type ExtrinsicBaseWeight = ();
 	type MaximumExtrinsicWeight = ();
 	type BaseCallFilter = ();
+	type SystemWeightInfo = ();
 }
-pub type System = system::Module<Runtime>;
+pub type System = frame_system::Module<Runtime>;
 
 impl orml_tokens::Trait for Runtime {
 	type Event = TestEvent;
@@ -81,6 +83,7 @@ impl orml_tokens::Trait for Runtime {
 	type Amount = Amount;
 	type CurrencyId = CurrencyId;
 	type OnReceived = ();
+	type WeightInfo = ();
 }
 pub type TokensModule = orml_tokens::Module<Runtime>;
 
@@ -94,6 +97,7 @@ impl pallet_balances::Trait for Runtime {
 	type Event = TestEvent;
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
+	type WeightInfo = ();
 }
 type PalletBalances = pallet_balances::Module<Runtime>;
 pub type NativeCurrency = orml_currencies::BasicCurrencyAdapter<PalletBalances, Balance, Balance, Amount, BlockNumber>;
@@ -107,6 +111,7 @@ impl orml_currencies::Trait for Runtime {
 	type MultiCurrency = TokensModule;
 	type NativeCurrency = NativeCurrency;
 	type GetNativeCurrencyId = GetNativeCurrencyId;
+	type WeightInfo = ();
 }
 pub type CurrenciesModule = orml_currencies::Module<Runtime>;
 
@@ -117,18 +122,23 @@ impl NomineesProvider<PolkadotAccountId> for MockNomineesProvider {
 	}
 }
 
-pub struct MockOnCommission;
-impl OnCommission<Balance, CurrencyId> for MockOnCommission {
-	fn on_commission(_currency_id: CurrencyId, _amount: Balance) {}
+thread_local! {
+	pub static TOTAL_COMMISSION: RefCell<Balance> = RefCell::new(0);
 }
 
-pub struct MockBridge;
+pub struct MockOnCommission;
+impl OnCommission<Balance, CurrencyId> for MockOnCommission {
+	fn on_commission(_currency_id: CurrencyId, amount: Balance) {
+		TOTAL_COMMISSION.with(|v| *v.borrow_mut() += amount);
+	}
+}
 
 parameter_types! {
 	pub const BondingDuration: EraIndex = 4;
 	pub const EraLength: BlockNumber = 10;
 }
 
+pub struct MockBridge;
 impl PolkadotBridgeType<BlockNumber, EraIndex> for MockBridge {
 	type BondingDuration = BondingDuration;
 	type EraLength = EraLength;
@@ -186,7 +196,7 @@ impl PolkadotBridge<AccountId, BlockNumber, Balance, EraIndex> for MockBridge {}
 parameter_types! {
 	pub const GetStakingCurrencyId: CurrencyId = DOT;
 	pub const GetLiquidCurrencyId: CurrencyId = LDOT;
-	pub MaxBondRatio: Ratio = Ratio::saturating_from_rational(60, 100);	// 60%
+	pub MaxBondRatio: Ratio = Ratio::saturating_from_rational(80, 100);	// 80%
 	pub MinBondRatio: Ratio = Ratio::saturating_from_rational(50, 100);	// 50%
 	pub MaxClaimFee: Rate = Rate::saturating_from_rational(10, 100);	// 10%
 	pub DefaultExchangeRate: ExchangeRate = ExchangeRate::saturating_from_rational(10, 100);	// 1 : 10
@@ -225,7 +235,9 @@ impl Default for ExtBuilder {
 
 impl ExtBuilder {
 	pub fn build(self) -> sp_io::TestExternalities {
-		let mut t = system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
+		let mut t = frame_system::GenesisConfig::default()
+			.build_storage::<Runtime>()
+			.unwrap();
 
 		orml_tokens::GenesisConfig::<Runtime> {
 			endowed_accounts: self.endowed_accounts,

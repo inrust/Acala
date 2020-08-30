@@ -8,13 +8,13 @@ use frame_system::EnsureSignedBy;
 use sp_core::H256;
 use sp_runtime::{testing::Header, traits::IdentityLookup, Perbill};
 use sp_std::cell::RefCell;
-use support::Rate;
+use support::{EmergencyShutdown, Rate};
 
 pub type AccountId = u128;
 pub type BlockNumber = u64;
 pub type Amount = i64;
 pub type Share = u64;
-pub type AuctionId = u64;
+pub type AuctionId = u32;
 
 pub const ALICE: AccountId = 0;
 pub const BOB: AccountId = 1;
@@ -35,7 +35,7 @@ impl_outer_origin! {
 
 impl_outer_event! {
 	pub enum TestEvent for Runtime {
-		system<T>,
+		frame_system<T>,
 		cdp_treasury,
 		orml_tokens<T>,
 		pallet_balances<T>,
@@ -51,7 +51,7 @@ parameter_types! {
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
 
-impl system::Trait for Runtime {
+impl frame_system::Trait for Runtime {
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = BlockNumber;
@@ -76,8 +76,9 @@ impl system::Trait for Runtime {
 	type ExtrinsicBaseWeight = ();
 	type MaximumExtrinsicWeight = ();
 	type BaseCallFilter = ();
+	type SystemWeightInfo = ();
 }
-pub type System = system::Module<Runtime>;
+pub type System = frame_system::Module<Runtime>;
 
 impl orml_tokens::Trait for Runtime {
 	type Event = TestEvent;
@@ -85,6 +86,7 @@ impl orml_tokens::Trait for Runtime {
 	type Amount = Amount;
 	type CurrencyId = CurrencyId;
 	type OnReceived = ();
+	type WeightInfo = ();
 }
 pub type Tokens = orml_tokens::Module<Runtime>;
 
@@ -97,7 +99,8 @@ impl pallet_balances::Trait for Runtime {
 	type DustRemoval = ();
 	type Event = TestEvent;
 	type ExistentialDeposit = ExistentialDeposit;
-	type AccountStore = system::Module<Runtime>;
+	type AccountStore = frame_system::Module<Runtime>;
+	type WeightInfo = ();
 }
 pub type PalletBalances = pallet_balances::Module<Runtime>;
 pub type AdaptedBasicCurrency =
@@ -112,6 +115,7 @@ impl orml_currencies::Trait for Runtime {
 	type MultiCurrency = Tokens;
 	type NativeCurrency = AdaptedBasicCurrency;
 	type GetNativeCurrencyId = GetNativeCurrencyId;
+	type WeightInfo = ();
 }
 pub type Currencies = orml_currencies::Module<Runtime>;
 
@@ -132,6 +136,7 @@ impl dex::Trait for Runtime {
 	type CDPTreasury = CDPTreasuryModule;
 	type UpdateOrigin = EnsureSignedBy<One, AccountId>;
 	type ModuleId = DEXModuleId;
+	type EmergencyShutdown = MockEmergencyShutdown;
 }
 pub type DEXModule = dex::Module<Runtime>;
 
@@ -152,16 +157,19 @@ impl AuctionManager<AccountId> for MockAuctionManager {
 		_currency_id: Self::CurrencyId,
 		_amount: Self::Balance,
 		_target: Self::Balance,
-	) {
+	) -> DispatchResult {
 		TOTAL_COLLATERAL_AUCTION.with(|v| *v.borrow_mut() += 1);
+		Ok(())
 	}
 
-	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) {
+	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) -> DispatchResult {
 		TOTAL_DEBIT_AUCTION.with(|v| *v.borrow_mut() += 1);
+		Ok(())
 	}
 
-	fn new_surplus_auction(_amount: Self::Balance) {
+	fn new_surplus_auction(_amount: Self::Balance) -> DispatchResult {
 		TOTAL_SURPLUS_AUCTION.with(|v| *v.borrow_mut() += 1);
+		Ok(())
 	}
 
 	fn cancel_auction(_id: Self::AuctionId) -> DispatchResult {
@@ -192,6 +200,17 @@ ord_parameter_types! {
 
 parameter_types! {
 	pub const CDPTreasuryModuleId: ModuleId = ModuleId(*b"aca/cdpt");
+}
+
+thread_local! {
+	static IS_SHUTDOWN: RefCell<bool> = RefCell::new(false);
+}
+
+pub struct MockEmergencyShutdown;
+impl EmergencyShutdown for MockEmergencyShutdown {
+	fn is_shutdown() -> bool {
+		IS_SHUTDOWN.with(|v| *v.borrow_mut())
+	}
 }
 
 impl Trait for Runtime {
@@ -225,7 +244,9 @@ impl Default for ExtBuilder {
 
 impl ExtBuilder {
 	pub fn build(self) -> sp_io::TestExternalities {
-		let mut t = system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
+		let mut t = frame_system::GenesisConfig::default()
+			.build_storage::<Runtime>()
+			.unwrap();
 
 		orml_tokens::GenesisConfig::<Runtime> {
 			endowed_accounts: self.endowed_accounts,

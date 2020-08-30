@@ -2,10 +2,13 @@
 //!
 //! ## Overview
 //!
-//! Built-in decentralized exchange modules in Acala network, the core currency type of trading pairs is stable coin (aUSD),
-//! the trading mechanism refers to the design of Uniswap. In addition to being used for trading, DEX also participates
-//! in CDP liquidation, which is faster than liquidation by auction when the liquidity is sufficient. And providing market
-//! making liquidity for DEX will also receive stable coin as additional reward for its participation in the CDP liquidation.
+//! Built-in decentralized exchange modules in Acala network, the core currency
+//! type of trading pairs is stable currency (aUSD), the trading mechanism
+//! refers to the design of Uniswap. In addition to being used for trading, DEX
+//! also participates in CDP liquidation, which is faster than liquidation by
+//! auction when the liquidity is sufficient. And providing market making
+//! liquidity for DEX will also receive stable currency as additional reward for
+//! its participation in the CDP liquidation.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -22,12 +25,12 @@ use primitives::{Balance, CurrencyId};
 use sp_runtime::{
 	traits::{
 		AccountIdConversion, AtLeast32Bit, CheckedAdd, CheckedMul, CheckedSub, MaybeSerializeDeserialize, Member, One,
-		UniqueSaturatedInto, Zero,
+		Saturating, UniqueSaturatedInto, Zero,
 	},
 	DispatchError, DispatchResult, FixedPointNumber, FixedPointOperand, ModuleId,
 };
 use sp_std::prelude::Vec;
-use support::{CDPTreasury, DEXManager, OnEmergencyShutdown, Price, Rate, Ratio};
+use support::{CDPTreasury, DEXManager, EmergencyShutdown, Price, Rate, Ratio};
 
 mod benchmarking;
 mod mock;
@@ -36,7 +39,8 @@ mod tests;
 pub trait Trait: system::Trait {
 	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
 
-	/// Associate type for measuring liquidity contribution of specific trading pairs
+	/// Associate type for measuring liquidity contribution of specific trading
+	/// pairs
 	type Share: Parameter + Member + AtLeast32Bit + Default + Copy + MaybeSerializeDeserialize + FixedPointOperand;
 
 	/// The origin which may update parameters of dex. Root can always do this.
@@ -48,7 +52,8 @@ pub trait Trait: system::Trait {
 	/// CDP treasury for depositing additional liquidity reward to DEX
 	type CDPTreasury: CDPTreasury<Self::AccountId, Balance = Balance, CurrencyId = CurrencyId>;
 
-	/// Allowed trading currency type list, each currency type forms a trading pair with the base currency
+	/// Allowed trading currency type list, each currency type forms a trading
+	/// pair with the base currency
 	type EnabledCurrencyIds: Get<Vec<CurrencyId>>;
 
 	/// The base currency as the core currency in all trading pairs
@@ -59,6 +64,9 @@ pub trait Trait: system::Trait {
 
 	/// The DEX's module id, keep all assets in DEX.
 	type ModuleId: Get<ModuleId>;
+
+	/// Emergency shutdown.
+	type EmergencyShutdown: EmergencyShutdown;
 }
 
 decl_event!(
@@ -122,9 +130,6 @@ decl_storage! {
 		/// Withdrawn interest indexed by currency type and account id
 		/// CurrencyType -> Owner -> WithdrawnInterest
 		WithdrawnInterest get(fn withdrawn_interest): double_map hasher(twox_64_concat) CurrencyId, hasher(twox_64_concat) T::AccountId => Balance;
-
-		/// System shutdown flag
-		IsShutdown get(fn is_shutdown): bool;
 	}
 
 	add_extra_genesis {
@@ -164,12 +169,12 @@ decl_module! {
 		///
 		/// # <weight>
 		/// - Complexity: `O(1)`
-		/// - Db reads:
-		/// - Db writes: LiquidityIncentiveRate
+		/// - Db reads: 0
+		/// - Db writes: 1
 		/// -------------------
-		/// Base Weight: 3.591 µs
+		/// Base Weight: 24.92 µs
 		/// # </weight>
-		#[weight = (4 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(0, 1), DispatchClass::Operational)]
+		#[weight = (25 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(0, 1), DispatchClass::Operational)]
 		pub fn set_liquidity_incentive_rate(
 			origin,
 			currency_id: CurrencyId,
@@ -192,12 +197,12 @@ decl_module! {
 		/// 	- T::Currency is orml_currencies
 		///		- T::CDPTreasury is module_cdp_treasury
 		/// - Complexity: `O(1)`
-		/// - Db reads: `WithdrawnInterest`, `TotalWithdrawnInterest`, 2 items of orml_currencies
-		/// - Db writes: `WithdrawnInterest`, `TotalWithdrawnInterest`, 2 items of orml_currencies
+		/// - Db reads: 8
+		/// - Db writes: 4
 		/// -------------------
-		/// Base Weight: 38.4 µs
+		/// Base Weight: 143.4 µs
 		/// # </weight>
-		#[weight = 39 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(4, 4)]
+		#[weight = 143 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(8, 4)]
 		pub fn withdraw_incentive_interest(origin, currency_id: CurrencyId) {
 			with_transaction_result(|| {
 				let who = ensure_signed(origin)?;
@@ -218,20 +223,20 @@ decl_module! {
 		/// 	- T::Currency is orml_currencies
 		/// - Complexity: `O(1)`
 		/// - Db reads:
-		///		- swap other to base: 1 * `LiquidityPool`, 4 items of orml_currencies
-		///		- swap base to other: 1 * `LiquidityPool`, 4 items of orml_currencies
-		///		- swap other to other: 2 * `LiquidityPool`, 4 items of orml_currencies
+		///		- swap base to other: 8
+		///		- swap other to base: 8
+		///		- swap other to other: 9
 		/// - Db writes:
-		///		- swap other to base: 1 * `LiquidityPool`, 4 items of orml_currencies
-		///		- swap base to other: 1 * `LiquidityPool`, 4 items of orml_currencies
-		///		- swap other to other: 2 * `LiquidityPool`, 4 items of orml_currencies
+		///		- swap base to other: 5
+		///		- swap other to base: 5
+		///		- swap other to other: 6
 		/// -------------------
 		/// Base Weight:
-		///		- swap base to other: 47.81 µs
-		///		- swap other to base: 42.57 µs
-		///		- swap other to other: 54.77 µs
+		///		- swap base to other: 192.1 µs
+		///		- swap other to base: 175.8 µs
+		///		- swap other to other: 199.7 µs
 		/// # </weight>
-		#[weight = 55 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(6, 6)]
+		#[weight = 200 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(9, 6)]
 		pub fn swap_currency(
 			origin,
 			supply_currency_id: CurrencyId,
@@ -252,24 +257,24 @@ decl_module! {
 		///
 		/// - `other_currency_id`: currency type to determine the type of liquidity pool.
 		/// - `max_other_currency_amount`: maximum currency amount allowed to inject to liquidity pool.
-		/// - `max_base_currency_amount`: maximum base currency(stable coin) amount allowed to inject to liquidity pool.
+		/// - `max_base_currency_amount`: maximum base currency(stable currency) amount allowed to inject to liquidity pool.
 		///
 		/// # <weight>
 		/// - Preconditions:
 		/// 	- T::Currency is orml_currencies
 		/// - Complexity: `O(1)`
 		/// - Db reads:
-		///		- best case: `TotalShares`, `LiquidityPool`, `Shares`, 4 items of orml_currencies
-		///		- worst case: `TotalShares`, `LiquidityPool`, `Shares`, `WithdrawnInterest`, `TotalInterest`, 4 items of orml_currencies
+		///		- best case: 9
+		///		- worst case: 10
 		/// - Db writes:
-		///		- best case: `TotalShares`, `LiquidityPool`, `Shares`, 4 items of orml_currencies
-		///		- worst case: `TotalShares`, `LiquidityPool`, `Shares`, `WithdrawnInterest`, `TotalInterest`, 4 items of orml_currencies
+		///		- best case: 7
+		///		- worst case: 9
 		/// -------------------
 		/// Base Weight:
-		///		- best case: 49.04 µs
-		///		- worst case: 57.72 µs
+		///		- best case: 177.6 µs
+		///		- worst case: 205.7 µs
 		/// # </weight>
-		#[weight = 58 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(8, 9)]
+		#[weight = 206 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(10, 9)]
 		pub fn add_liquidity(
 			origin,
 			other_currency_id: CurrencyId,
@@ -355,14 +360,14 @@ decl_module! {
 		/// - Preconditions:
 		/// 	- T::Currency is orml_currencies
 		/// - Complexity: `O(1)`
-		/// - Db reads: `Shares`, `LiquidityPool`, `TotalShares`, `WithdrawnInterest`, `TotalInterest`, 4 items of orml_currencies
-		/// - Db writes: `Shares`, `LiquidityPool`, `TotalShares`, `WithdrawnInterest`, `TotalInterest`, 4 items of orml_currencies
+		/// - Db reads: 11
+		/// - Db writes: 9
 		/// -------------------
 		/// Base Weight:
-		///		- best case: 66.59 µs
-		///		- worst case: 71.18 µs
+		///		- best case: 240.1 µs
+		///		- worst case: 248.2 µs
 		/// # </weight>
-		#[weight = 72 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(9, 9)]
+		#[weight = 248 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(11, 9)]
 		pub fn withdraw_liquidity(origin, currency_id: CurrencyId, #[compact] share_amount: T::Share) {
 			with_transaction_result(|| {
 				let who = ensure_signed(origin)?;
@@ -409,7 +414,7 @@ decl_module! {
 		///	- Db writes: `TotalInterest`, 2 items in cdp_treasury
 		/// - Db reads per currency_id: , `LiquidityPool`, `LiquidityIncentiveRate`
 		/// -------------------
-		/// Base Weight: 35.45 * N µs
+		/// Base Weight: 79.58 * N µs
 		/// # </weight>
 		fn on_initialize(_n: T::BlockNumber) -> Weight {
 			let mut consumed_weight = 0;
@@ -418,13 +423,21 @@ decl_module! {
 				consumed_weight += weight;
 			};
 
-			if !Self::is_shutdown() {
+			if !T::EmergencyShutdown::is_shutdown() {
 				add_weight(4, 3, 0);
+				let mut accumulated_interest: Balance = Zero::zero();
+
+				// accumulate interest
 				for currency_id in T::EnabledCurrencyIds::get() {
-					Self::accumulate_interest(currency_id);
-					add_weight(2, 0, 36_000_000);
+					let interest_to_issue = Self::accumulate_interest(currency_id);
+					accumulated_interest = accumulated_interest.saturating_add(interest_to_issue);
+					add_weight(2, 0, 80_000_000);
 				}
+
+				// issue aUSD as interest, ignore result
+				let _ = T::CDPTreasury::issue_debit(&Self::account_id(), accumulated_interest, false);
 			}
+
 			consumed_weight
 		}
 	}
@@ -441,22 +454,25 @@ impl<T: Trait> Module<T> {
 		supply_amount: Balance,
 		fee_rate: Rate,
 	) -> Balance {
-		// new_target_pool = supply_pool * target_pool / (supply_amount + supply_pool)
-		let new_target_pool = supply_pool
-			.checked_add(supply_amount)
-			.and_then(|n| Ratio::checked_from_rational(supply_pool, n))
-			.map(|n| n.saturating_mul_int(target_pool))
-			.unwrap_or_default();
-
-		// new_target_pool should be more then 0
-		if !new_target_pool.is_zero() {
-			// actual can get = (target_pool - new_target_pool) * (1 - fee_rate)
-			target_pool
-				.checked_sub(new_target_pool)
-				.and_then(|n| n.checked_sub(fee_rate.saturating_mul_int(n)))
-				.unwrap_or_default()
-		} else {
+		if supply_amount.is_zero() {
 			Zero::zero()
+		} else {
+			// new_target_pool = supply_pool * target_pool / (supply_amount + supply_pool)
+			let new_target_pool = supply_pool
+				.checked_add(supply_amount)
+				.and_then(|n| Ratio::checked_from_rational(supply_pool, n))
+				.and_then(|n| n.checked_mul_int(target_pool))
+				.unwrap_or_default();
+
+			if new_target_pool.is_zero() {
+				Zero::zero()
+			} else {
+				// target_amount = (target_pool - new_target_pool) * (1 - fee_rate)
+				target_pool
+					.checked_sub(new_target_pool)
+					.and_then(|n| Rate::one().saturating_sub(fee_rate).checked_mul_int(n))
+					.unwrap_or_default()
+			}
 		}
 	}
 
@@ -467,24 +483,35 @@ impl<T: Trait> Module<T> {
 		target_amount: Balance,
 		fee_rate: Rate,
 	) -> Balance {
-		// new_target_pool = target_pool - target_amount / (1 - fee_rate)
-		// supply_amount = target_pool * supply_pool / new_target_pool - supply_pool
 		if target_amount.is_zero() {
 			Zero::zero()
 		} else {
-			Rate::one()
-				.checked_sub(&fee_rate)
-				.and_then(|n| n.reciprocal())
-				.and_then(|n| n.checked_add(&Ratio::from_inner(1))) // add 1 to result in order to correct the possible losses caused by remainder discarding in internal division calculation
+			// new_target_pool = target_pool - target_amount / (1 - fee_rate)
+			let new_target_pool = Rate::one()
+				.saturating_sub(fee_rate)
+				.reciprocal()
+				.and_then(|n| n.checked_add(&Ratio::from_inner(1))) // add 1 to result in order to correct the possible losses caused by remainder discarding in internal
+				// division calculation
 				.and_then(|n| n.checked_mul_int(target_amount))
-				.and_then(|n| n.checked_add(Balance::one())) // add 1 to result in order to correct the possible losses caused by remainder discarding in internal division calculation
+				// add 1 to result in order to correct the possible losses caused by remainder discarding in internal
+				// division calculation
+				.and_then(|n| n.checked_add(Balance::one()))
 				.and_then(|n| target_pool.checked_sub(n))
-				.and_then(|n| Ratio::checked_from_rational(supply_pool, n))
-				.and_then(|n| n.checked_add(&Ratio::from_inner(1))) // add 1 to result in order to correct the possible losses caused by remainder discarding in internal division calculation
-				.and_then(|n| n.checked_mul_int(target_pool))
-				.and_then(|n| n.checked_add(Balance::one())) // add 1 to result in order to correct the possible losses caused by remainder discarding in internal division calculation
-				.and_then(|n| n.checked_sub(supply_pool))
-				.unwrap_or_default()
+				.unwrap_or_default();
+
+			if new_target_pool.is_zero() {
+				Zero::zero()
+			} else {
+				// supply_amount = target_pool * supply_pool / new_target_pool - supply_pool
+				Ratio::checked_from_rational(target_pool, new_target_pool)
+					.and_then(|n| n.checked_add(&Ratio::from_inner(1))) // add 1 to result in order to correct the possible losses caused by remainder discarding in
+					// internal division calculation
+					.and_then(|n| n.checked_mul_int(supply_pool))
+					.and_then(|n| n.checked_add(Balance::one())) // add 1 to result in order to correct the possible losses caused by remainder discarding in
+					// internal division calculation
+					.and_then(|n| n.checked_sub(supply_pool))
+					.unwrap_or_default()
+			}
 		}
 	}
 
@@ -648,8 +675,8 @@ impl<T: Trait> Module<T> {
 		Ok(target_turnover)
 	}
 
-	// get the minimum amount of supply currency needed for the target currency amount
-	// return 0 means cannot exchange
+	// get the minimum amount of supply currency needed for the target currency
+	// amount return 0 means cannot exchange
 	pub fn get_supply_amount_needed(
 		supply_currency_id: CurrencyId,
 		target_currency_id: CurrencyId,
@@ -693,8 +720,8 @@ impl<T: Trait> Module<T> {
 		}
 	}
 
-	// get the maximum amount of target currency you can get for the supply currency amount
-	// return 0 means cannot exchange
+	// get the maximum amount of target currency you can get for the supply currency
+	// amount return 0 means cannot exchange
 	pub fn get_target_amount_available(
 		supply_currency_id: CurrencyId,
 		target_currency_id: CurrencyId,
@@ -813,18 +840,17 @@ impl<T: Trait> Module<T> {
 		Ok(())
 	}
 
-	fn accumulate_interest(currency_id: CurrencyId) {
+	fn accumulate_interest(currency_id: CurrencyId) -> Balance {
 		let (_, base_currency_pool) = Self::liquidity_pool(currency_id);
 		let interest_to_increase = Self::liquidity_incentive_rate(currency_id).saturating_mul_int(base_currency_pool);
 
 		if !interest_to_increase.is_zero() {
-			// issue aUSD as interest
-			if T::CDPTreasury::issue_debit(&Self::account_id(), interest_to_increase, false).is_ok() {
-				TotalInterest::mutate(currency_id, |(total_interest, _)| {
-					*total_interest = total_interest.saturating_add(interest_to_increase);
-				});
-			}
+			TotalInterest::mutate(currency_id, |(total_interest, _)| {
+				*total_interest = total_interest.saturating_add(interest_to_increase);
+			});
 		}
+
+		interest_to_increase
 	}
 }
 
@@ -909,11 +935,5 @@ impl<T: Trait> DEXManager<T::AccountId, CurrencyId, Balance> for Module<T> {
 				.and_then(|n| n.checked_mul(&base_to_target_slippage))
 				.and_then(|n| n.checked_add(&supply_to_base_slippage))
 		}
-	}
-}
-
-impl<T: Trait> OnEmergencyShutdown for Module<T> {
-	fn on_emergency_shutdown() {
-		<IsShutdown>::put(true);
 	}
 }

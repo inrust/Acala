@@ -61,9 +61,9 @@ pub trait AuctionManager<AccountId> {
 		currency_id: Self::CurrencyId,
 		amount: Self::Balance,
 		target: Self::Balance,
-	);
-	fn new_debit_auction(amount: Self::Balance, fix: Self::Balance);
-	fn new_surplus_auction(amount: Self::Balance);
+	) -> DispatchResult;
+	fn new_debit_auction(amount: Self::Balance, fix: Self::Balance) -> DispatchResult;
+	fn new_surplus_auction(amount: Self::Balance) -> DispatchResult;
 	fn cancel_auction(id: Self::AuctionId) -> DispatchResult;
 
 	fn get_total_collateral_in_auction(id: Self::CurrencyId) -> Self::Balance;
@@ -159,18 +159,18 @@ pub trait CDPTreasury<AccountId> {
 	/// issue debit for cdp treasury
 	fn on_system_debit(amount: Self::Balance) -> DispatchResult;
 
-	/// issue surplus(stable coin) for cdp treasury
+	/// issue surplus(stable currency) for cdp treasury
 	fn on_system_surplus(amount: Self::Balance) -> DispatchResult;
 
 	/// issue debit to `who`
-	/// if backed flag is true, means the debit to issue is backed on some assets,
-	/// otherwise will increase same amount of debit to system debit.
+	/// if backed flag is true, means the debit to issue is backed on some
+	/// assets, otherwise will increase same amount of debit to system debit.
 	fn issue_debit(who: &AccountId, debit: Self::Balance, backed: bool) -> DispatchResult;
 
-	/// burn debit(stable coin) of `who`
+	/// burn debit(stable currency) of `who`
 	fn burn_debit(who: &AccountId, debit: Self::Balance) -> DispatchResult;
 
-	/// deposit surplus(stable coin) to cdp treasury by `from`
+	/// deposit surplus(stable currency) to cdp treasury by `from`
 	fn deposit_surplus(from: &AccountId, surplus: Self::Balance) -> DispatchResult;
 
 	/// deposit collateral assets to cdp treasury by `who`
@@ -191,7 +191,8 @@ pub trait CDPTreasuryExtended<AccountId>: CDPTreasury<AccountId> {
 		amount: Self::Balance,
 		target: Self::Balance,
 		refund_receiver: AccountId,
-	);
+		splited: bool,
+	) -> DispatchResult;
 }
 
 pub trait PriceProvider<CurrencyId> {
@@ -205,7 +206,6 @@ pub trait ExchangeRateProvider {
 	fn get_exchange_rate() -> ExchangeRate;
 }
 
-#[impl_trait_for_tuples::impl_for_tuples(30)]
-pub trait OnEmergencyShutdown {
-	fn on_emergency_shutdown();
+pub trait EmergencyShutdown {
+	fn is_shutdown() -> bool;
 }
