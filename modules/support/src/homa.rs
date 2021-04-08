@@ -1,3 +1,21 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use super::*;
 use frame_support::{traits::Get, Parameter};
 use sp_runtime::{
@@ -22,7 +40,9 @@ pub struct PolkadotUnlockChunk<Balance, EraIndex> {
 
 #[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug, Default)]
 pub struct PolkadotStakingLedger<Balance, EraIndex> {
+	/// Total amount, `active` plus all `unlocking`
 	pub total: Balance,
+	/// Amount at bonded
 	pub active: Balance,
 	pub unlocking: Vec<PolkadotUnlockChunk<Balance, EraIndex>>,
 }
@@ -36,19 +56,19 @@ pub trait PolkadotBridgeType<BlockNumber, EraIndex> {
 pub trait PolkadotBridgeCall<AccountId, BlockNumber, Balance, EraIndex>:
 	PolkadotBridgeType<BlockNumber, EraIndex>
 {
-	fn bond_extra(amount: Balance) -> DispatchResult;
-	fn unbond(amount: Balance) -> DispatchResult;
-	fn rebond(amount: Balance) -> DispatchResult;
-	fn withdraw_unbonded();
-	fn nominate(targets: Vec<Self::PolkadotAccountId>);
-	fn transfer_to_bridge(from: &AccountId, amount: Balance) -> DispatchResult;
-	fn receive_from_bridge(to: &AccountId, amount: Balance) -> DispatchResult;
-	fn payout_nominator();
+	fn bond_extra(account_index: u32, amount: Balance) -> DispatchResult;
+	fn unbond(account_index: u32, amount: Balance) -> DispatchResult;
+	fn rebond(account_index: u32, amount: Balance) -> DispatchResult;
+	fn withdraw_unbonded(account_index: u32);
+	fn nominate(account_index: u32, targets: Vec<Self::PolkadotAccountId>);
+	fn transfer_to_bridge(account_index: u32, from: &AccountId, amount: Balance) -> DispatchResult;
+	fn receive_from_bridge(account_index: u32, to: &AccountId, amount: Balance) -> DispatchResult;
+	fn payout_stakers(account_index: u32, era: EraIndex);
 }
 
 pub trait PolkadotBridgeState<Balance, EraIndex> {
-	fn ledger() -> PolkadotStakingLedger<Balance, EraIndex>;
-	fn balance() -> Balance;
+	fn staking_ledger(account_index: u32) -> PolkadotStakingLedger<Balance, EraIndex>;
+	fn free_balance(account_index: u32) -> Balance;
 	fn current_era() -> EraIndex;
 }
 

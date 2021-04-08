@@ -7,3 +7,6 @@
 
 .idea
 *.wasm
+*.state
+
+.vscode/launch.json

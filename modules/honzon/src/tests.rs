@@ -1,10 +1,28 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! Unit tests for the honzon module.
 
 #![cfg(test)]
 
 use super::*;
 use frame_support::{assert_noop, assert_ok};
-use mock::*;
+use mock::{Event, *};
 use orml_traits::Change;
 use sp_runtime::FixedPointNumber;
 use support::{Rate, Ratio};
@@ -15,7 +33,7 @@ fn authorize_should_work() {
 		System::set_block_number(1);
 		assert_ok!(HonzonModule::authorize(Origin::signed(ALICE), BTC, BOB));
 
-		let authorization_event = TestEvent::honzon(RawEvent::Authorization(ALICE, BOB, BTC));
+		let authorization_event = Event::honzon(crate::Event::Authorization(ALICE, BOB, BTC));
 		assert!(System::events()
 			.iter()
 			.any(|record| record.event == authorization_event));
@@ -32,7 +50,7 @@ fn unauthorize_should_work() {
 		assert_ok!(HonzonModule::check_authorization(&ALICE, &BOB, BTC));
 		assert_ok!(HonzonModule::unauthorize(Origin::signed(ALICE), BTC, BOB));
 
-		let unauthorization_event = TestEvent::honzon(RawEvent::UnAuthorization(ALICE, BOB, BTC));
+		let unauthorization_event = Event::honzon(crate::Event::UnAuthorization(ALICE, BOB, BTC));
 		assert!(System::events()
 			.iter()
 			.any(|record| record.event == unauthorization_event));
@@ -52,7 +70,7 @@ fn unauthorize_all_should_work() {
 		assert_ok!(HonzonModule::authorize(Origin::signed(ALICE), DOT, CAROL));
 		assert_ok!(HonzonModule::unauthorize_all(Origin::signed(ALICE)));
 
-		let unauthorization_all_event = TestEvent::honzon(RawEvent::UnAuthorizationAll(ALICE));
+		let unauthorization_all_event = Event::honzon(crate::Event::UnAuthorizationAll(ALICE));
 		assert!(System::events()
 			.iter()
 			.any(|record| record.event == unauthorization_all_event));

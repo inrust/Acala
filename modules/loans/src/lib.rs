@@ -1,3 +1,21 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! # Loans Module
 //!
 //! ## Overview
@@ -6,12 +24,11 @@
 //! assets.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(clippy::unused_unit)]
+#![allow(clippy::collapsible_if)]
 
-use codec::{Decode, Encode};
-use frame_support::{decl_error, decl_event, decl_module, decl_storage, traits::Get};
-use frame_system::{self as system};
-use orml_traits::{MultiCurrency, MultiCurrencyExtended};
-use orml_utilities::with_transaction_result;
+use frame_support::{log, pallet_prelude::*, transactional};
+use orml_traits::{Happened, MultiCurrency, MultiCurrencyExtended};
 use primitives::{Amount, Balance, CurrencyId};
 use sp_runtime::{
 	traits::{AccountIdConversion, Convert, Zero},
@@ -23,27 +40,7 @@ use support::{CDPTreasury, RiskManager};
 mod mock;
 mod tests;
 
-pub trait Trait: system::Trait {
-	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
-
-	/// Convert debit amount under specific collateral type to debit
-	/// value(stable currency)
-	type Convert: Convert<(CurrencyId, Balance), Balance>;
-
-	/// Currency type for deposit/withdraw collateral assets to/from loans
-	/// module
-	type Currency: MultiCurrencyExtended<Self::AccountId, CurrencyId = CurrencyId, Balance = Balance, Amount = Amount>;
-
-	/// Risk manager is used to limit the debit size of CDP
-	type RiskManager: RiskManager<Self::AccountId, CurrencyId, Balance, Balance>;
-
-	/// CDP treasury for issuing/burning stable currency adjust debit value
-	/// adjustment
-	type CDPTreasury: CDPTreasury<Self::AccountId, Balance = Balance, CurrencyId = CurrencyId>;
-
-	/// The loan's module id, keep all collaterals of CDPs.
-	type ModuleId: Get<ModuleId>;
-}
+pub use module::*;
 
 /// A collateralized debit position.
 #[derive(Encode, Decode, Eq, PartialEq, Copy, Clone, RuntimeDebug, Default)]
@@ -54,144 +51,177 @@ pub struct Position {
 	pub debit: Balance,
 }
 
-decl_storage! {
-	trait Store for Module<T: Trait> as Loans {
-		/// The collateralized debit positions, map from
-		/// Owner -> CollateralType -> Position
-		pub Positions get(fn positions): double_map hasher(twox_64_concat) CurrencyId, hasher(twox_64_concat) T::AccountId => Position;
+#[frame_support::pallet]
+pub mod module {
+	use super::*;
 
-		/// The total collateralized debit positions, map from
-		/// CollateralType -> Position
-		pub TotalPositions get(fn total_positions): map hasher(twox_64_concat) CurrencyId => Position;
+	#[pallet::config]
+	pub trait Config: frame_system::Config {
+		type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
+
+		/// Convert debit amount under specific collateral type to debit
+		/// value(stable currency)
+		type Convert: Convert<(CurrencyId, Balance), Balance>;
+
+		/// Currency type for deposit/withdraw collateral assets to/from loans
+		/// module
+		type Currency: MultiCurrencyExtended<
+			Self::AccountId,
+			CurrencyId = CurrencyId,
+			Balance = Balance,
+			Amount = Amount,
+		>;
+
+		/// Risk manager is used to limit the debit size of CDP
+		type RiskManager: RiskManager<Self::AccountId, CurrencyId, Balance, Balance>;
+
+		/// CDP treasury for issuing/burning stable currency adjust debit value
+		/// adjustment
+		type CDPTreasury: CDPTreasury<Self::AccountId, Balance = Balance, CurrencyId = CurrencyId>;
+
+		/// The loan's module id, keep all collaterals of CDPs.
+		#[pallet::constant]
+		type ModuleId: Get<ModuleId>;
+
+		/// Event handler which calls when update loan.
+		type OnUpdateLoan: Happened<(Self::AccountId, CurrencyId, Amount, Balance)>;
 	}
-}
 
-decl_event!(
-	pub enum Event<T> where
-		<T as system::Trait>::AccountId,
-		Amount = Amount,
-		Balance = Balance,
-		CurrencyId = CurrencyId,
-	{
-		/// Position updated. [owner, collateral_type, collateral_adjustment, debit_adjustment]
-		PositionUpdated(AccountId, CurrencyId, Amount, Amount),
-		/// Confiscate CDP's collateral assets and eliminate its debit. [owner, collateral_type, confiscated_collateral_amount, deduct_debit_amount]
-		ConfiscateCollateralAndDebit(AccountId, CurrencyId, Balance, Balance),
-		/// Transfer loan. [from, to, currency_id]
-		TransferLoan(AccountId, AccountId, CurrencyId),
-	}
-);
-
-decl_error! {
-	/// Error for loans module.
-	pub enum Error for Module<T: Trait> {
+	#[pallet::error]
+	pub enum Error<T> {
 		DebitOverflow,
 		DebitTooLow,
 		CollateralOverflow,
 		CollateralTooLow,
 		AmountConvertFailed,
 	}
-}
 
-decl_module! {
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-		type Error = Error<T>;
-		fn deposit_event() = default;
-
-		/// The loan's module id, keep all collaterals of CDPs.
-		const ModuleId: ModuleId = T::ModuleId::get();
+	#[pallet::event]
+	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
+	pub enum Event<T: Config> {
+		/// Position updated. \[owner, collateral_type, collateral_adjustment,
+		/// debit_adjustment\]
+		PositionUpdated(T::AccountId, CurrencyId, Amount, Amount),
+		/// Confiscate CDP's collateral assets and eliminate its debit. \[owner,
+		/// collateral_type, confiscated_collateral_amount,
+		/// deduct_debit_amount\]
+		ConfiscateCollateralAndDebit(T::AccountId, CurrencyId, Balance, Balance),
+		/// Transfer loan. \[from, to, currency_id\]
+		TransferLoan(T::AccountId, T::AccountId, CurrencyId),
 	}
+
+	/// The collateralized debit positions, map from
+	/// Owner -> CollateralType -> Position
+	#[pallet::storage]
+	#[pallet::getter(fn positions)]
+	pub type Positions<T: Config> =
+		StorageDoubleMap<_, Twox64Concat, CurrencyId, Twox64Concat, T::AccountId, Position, ValueQuery>;
+
+	/// The total collateralized debit positions, map from
+	/// CollateralType -> Position
+	#[pallet::storage]
+	#[pallet::getter(fn total_positions)]
+	pub type TotalPositions<T: Config> = StorageMap<_, Twox64Concat, CurrencyId, Position, ValueQuery>;
+
+	#[pallet::pallet]
+	pub struct Pallet<T>(PhantomData<T>);
+
+	#[pallet::hooks]
+	impl<T: Config> Hooks<T::BlockNumber> for Pallet<T> {}
+
+	#[pallet::call]
+	impl<T: Config> Pallet<T> {}
 }
 
-impl<T: Trait> Module<T> {
+impl<T: Config> Pallet<T> {
 	pub fn account_id() -> T::AccountId {
 		T::ModuleId::get().into_account()
 	}
 
-	/// confiscate collateral and debit to cdp treasury
+	/// confiscate collateral and debit to cdp treasury.
+	///
+	/// Ensured atomic.
+	#[transactional]
 	pub fn confiscate_collateral_and_debit(
 		who: &T::AccountId,
 		currency_id: CurrencyId,
 		collateral_confiscate: Balance,
 		debit_decrease: Balance,
 	) -> DispatchResult {
-		with_transaction_result(|| -> DispatchResult {
-			// use `with_transaction_result` to ensure operation is atomic
-			// convert balance type to amount type
-			let collateral_adjustment = Self::amount_try_from_balance(collateral_confiscate)?;
-			let debit_adjustment = Self::amount_try_from_balance(debit_decrease)?;
+		// convert balance type to amount type
+		let collateral_adjustment = Self::amount_try_from_balance(collateral_confiscate)?;
+		let debit_adjustment = Self::amount_try_from_balance(debit_decrease)?;
 
-			// transfer collateral to cdp treasury
-			T::CDPTreasury::deposit_collateral(&Self::account_id(), currency_id, collateral_confiscate)?;
+		// transfer collateral to cdp treasury
+		T::CDPTreasury::deposit_collateral(&Self::account_id(), currency_id, collateral_confiscate)?;
 
-			// deposit debit to cdp treasury
-			let bad_debt_value = T::RiskManager::get_bad_debt_value(currency_id, debit_decrease);
-			T::CDPTreasury::on_system_debit(bad_debt_value)?;
+		// deposit debit to cdp treasury
+		let bad_debt_value = T::RiskManager::get_bad_debt_value(currency_id, debit_decrease);
+		T::CDPTreasury::on_system_debit(bad_debt_value)?;
 
-			// update loan
-			Self::update_loan(
-				&who,
-				currency_id,
-				collateral_adjustment.saturating_neg(),
-				debit_adjustment.saturating_neg(),
-			)?;
+		// update loan
+		Self::update_loan(
+			&who,
+			currency_id,
+			collateral_adjustment.saturating_neg(),
+			debit_adjustment.saturating_neg(),
+		)?;
 
-			Self::deposit_event(RawEvent::ConfiscateCollateralAndDebit(
-				who.clone(),
-				currency_id,
-				collateral_confiscate,
-				debit_decrease,
-			));
-			Ok(())
-		})
+		Self::deposit_event(Event::ConfiscateCollateralAndDebit(
+			who.clone(),
+			currency_id,
+			collateral_confiscate,
+			debit_decrease,
+		));
+		Ok(())
 	}
 
-	/// adjust the position
+	/// adjust the position.
+	///
+	/// Ensured atomic.
+	#[transactional]
 	pub fn adjust_position(
 		who: &T::AccountId,
 		currency_id: CurrencyId,
 		collateral_adjustment: Amount,
 		debit_adjustment: Amount,
 	) -> DispatchResult {
-		with_transaction_result(|| -> DispatchResult {
-			// use `with_transaction_result` to ensure operation is atomic
-			// mutate collateral and debit
-			Self::update_loan(who, currency_id, collateral_adjustment, debit_adjustment)?;
+		// mutate collateral and debit
+		Self::update_loan(who, currency_id, collateral_adjustment, debit_adjustment)?;
 
-			let collateral_balance_adjustment = Self::balance_try_from_amount_abs(collateral_adjustment)?;
-			let debit_balance_adjustment = Self::balance_try_from_amount_abs(debit_adjustment)?;
-			let module_account = Self::account_id();
+		let collateral_balance_adjustment = Self::balance_try_from_amount_abs(collateral_adjustment)?;
+		let debit_balance_adjustment = Self::balance_try_from_amount_abs(debit_adjustment)?;
+		let module_account = Self::account_id();
 
-			if collateral_adjustment.is_positive() {
-				T::Currency::transfer(currency_id, who, &module_account, collateral_balance_adjustment)?;
-			} else if collateral_adjustment.is_negative() {
-				T::Currency::transfer(currency_id, &module_account, who, collateral_balance_adjustment)?;
-			}
+		if collateral_adjustment.is_positive() {
+			T::Currency::transfer(currency_id, who, &module_account, collateral_balance_adjustment)?;
+		} else if collateral_adjustment.is_negative() {
+			T::Currency::transfer(currency_id, &module_account, who, collateral_balance_adjustment)?;
+		}
 
-			if debit_adjustment.is_positive() {
-				// check debit cap when increase debit
-				T::RiskManager::check_debit_cap(currency_id, Self::total_positions(currency_id).debit)?;
+		if debit_adjustment.is_positive() {
+			// check debit cap when increase debit
+			T::RiskManager::check_debit_cap(currency_id, Self::total_positions(currency_id).debit)?;
 
-				// issue debit with collateral backed by cdp treasury
-				T::CDPTreasury::issue_debit(who, T::Convert::convert((currency_id, debit_balance_adjustment)), true)?;
-			} else if debit_adjustment.is_negative() {
-				// repay debit
-				// burn debit by cdp treasury
-				T::CDPTreasury::burn_debit(who, T::Convert::convert((currency_id, debit_balance_adjustment)))?;
-			}
+			// issue debit with collateral backed by cdp treasury
+			T::CDPTreasury::issue_debit(who, T::Convert::convert((currency_id, debit_balance_adjustment)), true)?;
+		} else if debit_adjustment.is_negative() {
+			// repay debit
+			// burn debit by cdp treasury
+			T::CDPTreasury::burn_debit(who, T::Convert::convert((currency_id, debit_balance_adjustment)))?;
+		}
 
-			// ensure pass risk check
-			let Position { collateral, debit } = Self::positions(currency_id, who);
-			T::RiskManager::check_position_valid(currency_id, collateral, debit)?;
+		// ensure pass risk check
+		let Position { collateral, debit } = Self::positions(currency_id, who);
+		T::RiskManager::check_position_valid(currency_id, collateral, debit)?;
 
-			Self::deposit_event(RawEvent::PositionUpdated(
-				who.clone(),
-				currency_id,
-				collateral_adjustment,
-				debit_adjustment,
-			));
-			Ok(())
-		})
+		Self::deposit_event(Event::PositionUpdated(
+			who.clone(),
+			currency_id,
+			collateral_adjustment,
+			debit_adjustment,
+		));
+		Ok(())
 	}
 
 	/// transfer whole loan of `from` to `to`
@@ -225,7 +255,7 @@ impl<T: Trait> Module<T> {
 		)?;
 		Self::update_loan(to, currency_id, collateral_adjustment, debit_adjustment)?;
 
-		Self::deposit_event(RawEvent::TransferLoan(from.clone(), to.clone(), currency_id));
+		Self::deposit_event(Event::TransferLoan(from.clone(), to.clone(), currency_id));
 		Ok(())
 	}
 
@@ -258,15 +288,25 @@ impl<T: Trait> Module<T> {
 
 			// increase account ref if new position
 			if p.collateral.is_zero() && p.debit.is_zero() {
-				system::Module::<T>::inc_ref(who);
+				if frame_system::Pallet::<T>::inc_consumers(who).is_err() {
+					// No providers for the locks. This is impossible under normal circumstances
+					// since the funds that are under the lock will themselves be stored in the
+					// account and therefore will need a reference.
+					log::warn!(
+						"Warning: Attempt to introduce lock consumer reference, yet no providers. \
+						This is unexpected but should be safe."
+					);
+				}
 			}
 
 			p.collateral = new_collateral;
+
+			T::OnUpdateLoan::happened(&(who.clone(), currency_id, debit_adjustment, p.debit));
 			p.debit = new_debit;
 
 			if p.collateral.is_zero() && p.debit.is_zero() {
 				// decrease account ref if zero position
-				system::Module::<T>::dec_ref(who);
+				frame_system::Pallet::<T>::dec_consumers(who);
 
 				// remove position storage if zero position
 				*may_be_position = None;
@@ -277,7 +317,7 @@ impl<T: Trait> Module<T> {
 			Ok(())
 		})?;
 
-		TotalPositions::try_mutate(currency_id, |total_positions| -> DispatchResult {
+		TotalPositions::<T>::try_mutate(currency_id, |total_positions| -> DispatchResult {
 			total_positions.collateral = if collateral_adjustment.is_positive() {
 				total_positions
 					.collateral
@@ -307,7 +347,7 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-impl<T: Trait> Module<T> {
+impl<T: Config> Pallet<T> {
 	/// Convert `Balance` to `Amount`.
 	fn amount_try_from_balance(b: Balance) -> result::Result<Amount, Error<T>> {
 		TryInto::<Amount>::try_into(b).map_err(|_| Error::<T>::AmountConvertFailed)

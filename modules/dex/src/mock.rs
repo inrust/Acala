@@ -1,190 +1,149 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! Mocks for the dex module.
 
 #![cfg(test)]
 
 use super::*;
-use frame_support::{impl_outer_event, impl_outer_origin, ord_parameter_types, parameter_types};
+use frame_support::{construct_runtime, ord_parameter_types, parameter_types};
 use frame_system::EnsureSignedBy;
+use orml_traits::{parameter_type_with_key, MultiReservableCurrency};
+use primitives::{Amount, TokenSymbol};
 use sp_core::H256;
-use sp_runtime::{testing::Header, traits::IdentityLookup, Perbill};
-use sp_std::cell::RefCell;
-use support::{AuctionManager, Rate};
+use sp_runtime::{testing::Header, traits::IdentityLookup};
 
-pub type AccountId = u128;
 pub type BlockNumber = u64;
-pub type Share = u128;
-pub type Amount = i128;
-pub type AuctionId = u32;
+pub type AccountId = u128;
 
 pub const ALICE: AccountId = 1;
 pub const BOB: AccountId = 2;
-pub const CAROL: AccountId = 3;
-pub const AUSD: CurrencyId = CurrencyId::AUSD;
-pub const BTC: CurrencyId = CurrencyId::XBTC;
-pub const DOT: CurrencyId = CurrencyId::DOT;
-pub const ACA: CurrencyId = CurrencyId::ACA;
-pub const LDOT: CurrencyId = CurrencyId::LDOT;
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Runtime;
+pub const AUSD: CurrencyId = CurrencyId::Token(TokenSymbol::AUSD);
+pub const XBTC: CurrencyId = CurrencyId::Token(TokenSymbol::XBTC);
+pub const DOT: CurrencyId = CurrencyId::Token(TokenSymbol::DOT);
+pub const ACA: CurrencyId = CurrencyId::Token(TokenSymbol::ACA);
+pub const AUSD_XBTC_PAIR: TradingPair = TradingPair(AUSD, XBTC);
+pub const AUSD_DOT_PAIR: TradingPair = TradingPair(AUSD, DOT);
+pub const DOT_XBTC_PAIR: TradingPair = TradingPair(DOT, XBTC);
 
 mod dex {
 	pub use super::super::*;
 }
 
-impl_outer_event! {
-	pub enum TestEvent for Runtime {
-		frame_system<T>,
-		dex<T>,
-		orml_tokens<T>,
-		cdp_treasury,
-	}
-}
-
-impl_outer_origin! {
-	pub enum Origin for Runtime {}
-}
-
 parameter_types! {
-	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: u32 = 1024;
-	pub const MaximumBlockLength: u32 = 2 * 1024;
-	pub const AvailableBlockRatio: Perbill = Perbill::one();
+	pub const BlockHashCount: BlockNumber = 250;
 }
 
-impl frame_system::Trait for Runtime {
+impl frame_system::Config for Runtime {
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = BlockNumber;
-	type Call = ();
+	type Call = Call;
 	type Hash = H256;
 	type Hashing = ::sp_runtime::traits::BlakeTwo256;
 	type AccountId = AccountId;
 	type Lookup = IdentityLookup<Self::AccountId>;
 	type Header = Header;
-	type Event = TestEvent;
+	type Event = Event;
 	type BlockHashCount = BlockHashCount;
-	type MaximumBlockWeight = MaximumBlockWeight;
-	type MaximumBlockLength = MaximumBlockLength;
-	type AvailableBlockRatio = AvailableBlockRatio;
+	type BlockWeights = ();
+	type BlockLength = ();
 	type Version = ();
-	type ModuleToIndex = ();
+	type PalletInfo = PalletInfo;
 	type AccountData = pallet_balances::AccountData<Balance>;
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
 	type DbWeight = ();
-	type BlockExecutionWeight = ();
-	type ExtrinsicBaseWeight = ();
-	type MaximumExtrinsicWeight = ();
 	type BaseCallFilter = ();
 	type SystemWeightInfo = ();
+	type SS58Prefix = ();
+	type OnSetCode = ();
 }
-pub type System = frame_system::Module<Runtime>;
 
-impl orml_tokens::Trait for Runtime {
-	type Event = TestEvent;
+parameter_type_with_key! {
+	pub ExistentialDeposits: |_currency_id: CurrencyId| -> Balance {
+		Default::default()
+	};
+}
+
+impl orml_tokens::Config for Runtime {
+	type Event = Event;
 	type Balance = Balance;
 	type Amount = Amount;
 	type CurrencyId = CurrencyId;
-	type OnReceived = ();
 	type WeightInfo = ();
+	type ExistentialDeposits = ExistentialDeposits;
+	type OnDust = ();
 }
-pub type Tokens = orml_tokens::Module<Runtime>;
+
+pub struct MockDEXIncentives;
+impl DEXIncentives<AccountId, CurrencyId, Balance> for MockDEXIncentives {
+	fn do_deposit_dex_share(who: &AccountId, lp_currency_id: CurrencyId, amount: Balance) -> DispatchResult {
+		Tokens::reserve(lp_currency_id, who, amount)
+	}
+
+	fn do_withdraw_dex_share(who: &AccountId, lp_currency_id: CurrencyId, amount: Balance) -> DispatchResult {
+		let _ = Tokens::unreserve(lp_currency_id, who, amount);
+		Ok(())
+	}
+}
 
 ord_parameter_types! {
-	pub const One: AccountId = 1;
+	pub const ListingOrigin: AccountId = 3;
 }
 
 parameter_types! {
-	pub const GetStableCurrencyId: CurrencyId = AUSD;
-	pub const MaxAuctionsCount: u32 = 10_000;
-	pub const CDPTreasuryModuleId: ModuleId = ModuleId(*b"aca/cdpt");
-}
-
-impl cdp_treasury::Trait for Runtime {
-	type Event = TestEvent;
-	type Currency = Tokens;
-	type GetStableCurrencyId = GetStableCurrencyId;
-	type AuctionManagerHandler = MockAuctionManagerHandler;
-	type UpdateOrigin = EnsureSignedBy<One, AccountId>;
-	type DEX = ();
-	type MaxAuctionsCount = MaxAuctionsCount;
-	type ModuleId = CDPTreasuryModuleId;
-}
-pub type CDPTreasuryModule = cdp_treasury::Module<Runtime>;
-
-pub struct MockAuctionManagerHandler;
-impl AuctionManager<AccountId> for MockAuctionManagerHandler {
-	type CurrencyId = CurrencyId;
-	type Balance = Balance;
-	type AuctionId = AuctionId;
-	fn new_collateral_auction(
-		_who: &AccountId,
-		_currency_id: Self::CurrencyId,
-		_amount: Self::Balance,
-		_target: Self::Balance,
-	) -> DispatchResult {
-		unimplemented!()
-	}
-	fn new_debit_auction(_amount: Self::Balance, _fix: Self::Balance) -> DispatchResult {
-		unimplemented!()
-	}
-	fn new_surplus_auction(_amount: Self::Balance) -> DispatchResult {
-		unimplemented!()
-	}
-	fn cancel_auction(_id: Self::AuctionId) -> DispatchResult {
-		unimplemented!()
-	}
-
-	fn get_total_collateral_in_auction(_id: Self::CurrencyId) -> Self::Balance {
-		unimplemented!()
-	}
-	fn get_total_surplus_in_auction() -> Self::Balance {
-		unimplemented!()
-	}
-	fn get_total_debit_in_auction() -> Self::Balance {
-		unimplemented!()
-	}
-	fn get_total_target_in_auction() -> Self::Balance {
-		unimplemented!()
-	}
-}
-
-thread_local! {
-	static IS_SHUTDOWN: RefCell<bool> = RefCell::new(false);
-}
-
-pub struct MockEmergencyShutdown;
-impl EmergencyShutdown for MockEmergencyShutdown {
-	fn is_shutdown() -> bool {
-		IS_SHUTDOWN.with(|v| *v.borrow_mut())
-	}
-}
-
-parameter_types! {
-	pub const GetBaseCurrencyId: CurrencyId = AUSD;
-	pub GetExchangeFee: Rate = Rate::saturating_from_rational(1, 100);
-	pub EnabledCurrencyIds : Vec<CurrencyId> = vec![BTC, DOT];
+	pub const GetExchangeFee: (u32, u32) = (1, 100);
+	pub const TradingPathLimit: u32 = 3;
 	pub const DEXModuleId: ModuleId = ModuleId(*b"aca/dexm");
 }
 
-impl Trait for Runtime {
-	type Event = TestEvent;
+impl Config for Runtime {
+	type Event = Event;
 	type Currency = Tokens;
-	type Share = Share;
-	type EnabledCurrencyIds = EnabledCurrencyIds;
-	type GetBaseCurrencyId = GetBaseCurrencyId;
 	type GetExchangeFee = GetExchangeFee;
-	type CDPTreasury = CDPTreasuryModule;
-	type UpdateOrigin = EnsureSignedBy<One, AccountId>;
+	type TradingPathLimit = TradingPathLimit;
 	type ModuleId = DEXModuleId;
-	type EmergencyShutdown = MockEmergencyShutdown;
+	type WeightInfo = ();
+	type DEXIncentives = MockDEXIncentives;
+	type ListingOrigin = EnsureSignedBy<ListingOrigin, AccountId>;
 }
-pub type DexModule = Module<Runtime>;
+
+type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Runtime>;
+type Block = frame_system::mocking::MockBlock<Runtime>;
+
+construct_runtime!(
+	pub enum Runtime where
+		Block = Block,
+		NodeBlock = Block,
+		UncheckedExtrinsic = UncheckedExtrinsic,
+	{
+		System: frame_system::{Pallet, Call, Storage, Config, Event<T>},
+		DexModule: dex::{Pallet, Storage, Call, Event<T>, Config<T>},
+		Tokens: orml_tokens::{Pallet, Storage, Event<T>, Config<T>},
+	}
+);
 
 pub struct ExtBuilder {
 	endowed_accounts: Vec<(AccountId, CurrencyId, Balance)>,
-	liquidity_incentive_rate: Vec<(CurrencyId, Rate)>,
+	initial_listing_trading_pairs: Vec<(TradingPair, (Balance, Balance), (Balance, Balance), BlockNumber)>,
+	initial_enabled_trading_pairs: Vec<TradingPair>,
+	initial_added_liquidity_pools: Vec<(AccountId, Vec<(TradingPair, (Balance, Balance))>)>,
 }
 
 impl Default for ExtBuilder {
@@ -193,24 +152,60 @@ impl Default for ExtBuilder {
 			endowed_accounts: vec![
 				(ALICE, AUSD, 1_000_000_000_000_000_000u128),
 				(BOB, AUSD, 1_000_000_000_000_000_000u128),
-				(ALICE, BTC, 1_000_000_000_000_000_000u128),
-				(BOB, BTC, 1_000_000_000_000_000_000u128),
+				(ALICE, XBTC, 1_000_000_000_000_000_000u128),
+				(BOB, XBTC, 1_000_000_000_000_000_000u128),
 				(ALICE, DOT, 1_000_000_000_000_000_000u128),
 				(BOB, DOT, 1_000_000_000_000_000_000u128),
 			],
-			liquidity_incentive_rate: vec![
-				(BTC, Rate::saturating_from_rational(1, 100)),
-				(DOT, Rate::saturating_from_rational(1, 100)),
-			],
+			initial_listing_trading_pairs: vec![],
+			initial_enabled_trading_pairs: vec![],
+			initial_added_liquidity_pools: vec![],
 		}
 	}
 }
 
 impl ExtBuilder {
-	pub fn set_balance(mut self, who: AccountId, currency_id: CurrencyId, balance: Balance) -> Self {
-		self.endowed_accounts.push((who, currency_id, balance));
+	pub fn initialize_listing_trading_pairs(mut self) -> Self {
+		self.initial_listing_trading_pairs = vec![
+			(
+				AUSD_DOT_PAIR,
+				(5_000_000_000_000u128, 1_000_000_000_000u128),
+				(5_000_000_000_000_000u128, 1_000_000_000_000_000u128),
+				10,
+			),
+			(
+				AUSD_XBTC_PAIR,
+				(20_000_000_000_000u128, 1_000_000_000u128),
+				(20_000_000_000_000_000u128, 1_000_000_000_000u128),
+				10,
+			),
+			(
+				DOT_XBTC_PAIR,
+				(4_000_000_000_000u128, 1_000_000_000u128),
+				(4_000_000_000_000_000u128, 1_000_000_000_000u128),
+				20,
+			),
+		];
 		self
 	}
+
+	pub fn initialize_enabled_trading_pairs(mut self) -> Self {
+		self.initial_enabled_trading_pairs = vec![AUSD_DOT_PAIR, AUSD_XBTC_PAIR, DOT_XBTC_PAIR];
+		self
+	}
+
+	pub fn initialize_added_liquidity_pools(mut self, who: AccountId) -> Self {
+		self.initial_added_liquidity_pools = vec![(
+			who,
+			vec![
+				(AUSD_DOT_PAIR, (1_000_000u128, 2_000_000u128)),
+				(AUSD_XBTC_PAIR, (1_000_000u128, 2_000_000u128)),
+				(DOT_XBTC_PAIR, (1_000_000u128, 2_000_000u128)),
+			],
+		)];
+		self
+	}
+
 	pub fn build(self) -> sp_io::TestExternalities {
 		let mut t = frame_system::GenesisConfig::default()
 			.build_storage::<Runtime>()
@@ -222,8 +217,10 @@ impl ExtBuilder {
 		.assimilate_storage(&mut t)
 		.unwrap();
 
-		dex::GenesisConfig {
-			liquidity_incentive_rate: self.liquidity_incentive_rate,
+		dex::GenesisConfig::<Runtime> {
+			initial_listing_trading_pairs: self.initial_listing_trading_pairs,
+			initial_enabled_trading_pairs: self.initial_enabled_trading_pairs,
+			initial_added_liquidity_pools: self.initial_added_liquidity_pools,
 		}
 		.assimilate_storage(&mut t)
 		.unwrap();

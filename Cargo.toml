@@ -1,52 +1,52 @@
-[package]
-name = "acala"
-version = "0.5.4"
-authors = ["Acala Developers"]
-edition = "2018"
-
-[[bin]]
-name = "acala"
-path = "src/main.rs"
-
-[dependencies]
-futures = "0.3.4"
-parity-util-mem = { version = "0.7.0", default-features = false, features = ["jemalloc-global"] }
-acala-cli = { path = "cli" }
-acala-service = { path = "service" }
-
-[features]
-runtime-benchmarks = [
-	"acala-cli/runtime-benchmarks",
-]
-
-[profile.release]
-# Acala runtime requires unwinding.
-panic = "unwind"
+cargo-features = ["resolver"]
 
 [workspace]
 members = [
+	"bin/acala",
+	"bin/acala/cli",
+	"bin/acala/service",
+
 	"modules/*",
-	"cli",
 	"inspect",
 	"primitives",
 	"rpc",
+
 	"runtime/common",
-	"runtime/dev",
-	"service",
+	"runtime/mandala",
+	"runtime/karura",
+	"runtime/acala",
 
 	"orml/auction",
 	"orml/authority",
 	"orml/benchmarking",
 	"orml/currencies",
 	"orml/gradually-update",
+	"orml/nft",
 	"orml/oracle",
+	"orml/oracle/rpc",
+ 	"orml/oracle/rpc/runtime-api",
+	"orml/rewards",
 	"orml/tokens",
 	"orml/traits",
 	"orml/utilities",
 	"orml/vesting",
-	"ecosystem-modules/template/template",
+	"orml/xtokens",
+	"orml/xcm-support",
+	"orml/unknown-tokens",
+
 	"ecosystem-modules/ren/renvm-bridge",
 ]
+exclude = [
+	"bin/acala-dev",
+	"bin/acala-dev/cli",
+	"bin/acala-dev/service",
+]
+
+resolver = "2"
+
+[profile.release]
+# Acala runtime requires unwinding.
+panic = "unwind"
 
 # The list of dependencies below (which can be both direct and indirect dependencies) are crates
 # that are suspected to be CPU-intensive, and that are unlikely to require debugging (as some of
@@ -69,7 +69,6 @@ aesni = { opt-level = 3 }
 blake2 = { opt-level = 3 }
 blake2-rfc = { opt-level = 3 }
 blake2b_simd = { opt-level = 3 }
-blake2s_simd = { opt-level = 3 }
 chacha20poly1305 = { opt-level = 3 }
 cranelift-codegen = { opt-level = 3 }
 cranelift-wasm = { opt-level = 3 }
@@ -98,7 +97,6 @@ num-bigint = { opt-level = 3 }
 parking_lot = { opt-level = 3 }
 parking_lot_core = { opt-level = 3 }
 percent-encoding = { opt-level = 3 }
-primitive-types = { opt-level = 3 }
 ring = { opt-level = 3 }
 rustls = { opt-level = 3 }
 sha2 = { opt-level = 3 }
@@ -111,3 +109,9 @@ wasmi = { opt-level = 3 }
 x25519-dalek = { opt-level = 3 }
 yamux = { opt-level = 3 }
 zeroize = { opt-level = 3 }
+
+[patch.crates-io]
+evm = { git = "https://github.com/rust-blockchain/evm.git", rev = "f90f8432fc0070a6de9e2532e5d0fcef7a041fd7" }
+evm-core = { git = "https://github.com/rust-blockchain/evm.git", rev = "f90f8432fc0070a6de9e2532e5d0fcef7a041fd7" }
+evm-gasometer = { git = "https://github.com/rust-blockchain/evm.git", rev = "f90f8432fc0070a6de9e2532e5d0fcef7a041fd7" }
+evm-runtime = { git = "https://github.com/rust-blockchain/evm.git", rev = "f90f8432fc0070a6de9e2532e5d0fcef7a041fd7" }

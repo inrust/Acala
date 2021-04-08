@@ -10,8 +10,10 @@
 [![License](https://img.shields.io/github/license/AcalaNetwork/Acala?color=green)](https://github.com/AcalaNetwork/Acala/blob/master/LICENSE)
  <br />
 [![Twitter URL](https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Ftwitter.com%2FAcalaNetwork)](https://twitter.com/AcalaNetwork)
-[![Riot.im](https://img.shields.io/badge/Riot.im-Welcome-blue?logo=riot)](https://riot.im/app/#/room/#acala:matrix.org)
-[![Medium](https://img.shields.io/badge/Medium-AcalaNetwork-brightgreen?logo=medium)](https://medium.com/acalanetwork)
+[![Riot.im](https://img.shields.io/badge/Riot.im-gray?logo=riot)](https://riot.im/app/#/room/#acala:matrix.org)
+[![Discord](https://img.shields.io/badge/Discord-gray?logo=discord)](https://discord.gg/vdbFVCH)
+[![Telegram](https://img.shields.io/badge/Telegram-gray?logo=telegram)](https://t.me/AcalaOfficial)
+[![Medium](https://img.shields.io/badge/Medium-gray?logo=medium)](https://medium.com/acalanetwork)
 
 </div>
 
@@ -76,11 +78,9 @@ Note: This section is still work in progress, we will update more information as
 
 ## NOTE
 
-To connect on the "Mandala TC3" network, you will want the version `~0.4.2` code which is in this repo.
+To connect on the "Mandala TC6" network, you will want the version `~0.7.10` code which is in this repo.
 
-- **Mandala TC3** is in this [Acala](https://github.com/AcalaNetwork/Acala/tree/mandala-tc3) repo branch `mandala-tc3`.
-
-- **Mandala TC2** is in this [Acala](https://github.com/AcalaNetwork/Acala/tree/mandala) repo branch `mandala`.
+- **Mandala TC6** is in [Acala repo master branch](https://github.com/AcalaNetwork/Acala/tree/master/).
 
 Install Rust:
 
@@ -100,10 +100,10 @@ Install required tools and install git hooks:
 make init
 ```
 
-Build all native code:
+Build Mandala TC native code:
 
 ```bash
-make build
+make build-dev
 ```
 
 # 4. Run
@@ -119,7 +119,7 @@ make run
 To type check:
 
 ```bash
-make check
+make check-all
 ```
 
 To purge old chain data:
@@ -141,3 +141,20 @@ make update
 ```
 
 __Note:__ All build command from Makefile are designed for local development purposes and hence have `SKIP_WASM_BUILD` enabled to speed up build time and use `--execution native` to only run use native execution mode.
+
+# 6. Bench Bot
+Bench bot can take care of syncing branch with `master` and generating WeightInfos for module or runtime.
+
+## Generate module weights
+
+Comment on a PR `/bench runtime module <module_name>` i.e.: `module_currencies`
+
+Bench bot will do the benchmarking, generate `weights.rs` file push changes into your branch.
+
+## Generate runtime weights
+
+Comment on a PR `/bench runtime <runtime> <module_name>` i.e.: `/bench runtime mandala module_currencies`.
+
+To generate weights for all modules just pass `*` as `module_name` i.e: `/bench runtime mandala *`
+
+Bench bot will do the benchmarking, generate weights file push changes into your branch.

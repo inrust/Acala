@@ -1,12 +1,28 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! Unit tests for the loans module.
 
 #![cfg(test)]
 
 use super::*;
 use frame_support::{assert_noop, assert_ok};
-use mock::{
-	CDPTreasuryModule, Currencies, ExtBuilder, LoansModule, Runtime, System, TestEvent, ALICE, AUSD, BOB, BTC, DOT,
-};
+use mock::{Event, *};
 
 #[test]
 fn debits_key() {
@@ -69,7 +85,7 @@ fn adjust_position_should_work() {
 		assert_eq!(LoansModule::positions(BTC, &ALICE).collateral, 500);
 		assert_eq!(Currencies::free_balance(AUSD, &ALICE), 150);
 
-		let update_position_event = TestEvent::loans(RawEvent::PositionUpdated(ALICE, BTC, 500, 300));
+		let update_position_event = Event::loans(crate::Event::PositionUpdated(ALICE, BTC, 500, 300));
 		assert!(System::events()
 			.iter()
 			.any(|record| record.event == update_position_event));
@@ -86,7 +102,8 @@ fn update_loan_should_work() {
 		assert_eq!(LoansModule::positions(BTC, &ALICE).debit, 0);
 		assert_eq!(LoansModule::positions(BTC, &ALICE).collateral, 0);
 		assert_eq!(<Positions<Runtime>>::contains_key(BTC, &ALICE), false);
-		assert_eq!(System::refs(&ALICE), 0);
+
+		let alice_ref_count_0 = System::consumers(&ALICE);
 
 		assert_ok!(LoansModule::update_loan(&ALICE, BTC, 3000, 2000));
 
@@ -97,7 +114,8 @@ fn update_loan_should_work() {
 		assert_eq!(LoansModule::positions(BTC, &ALICE).collateral, 3000);
 
 		// increase ref count when open new position
-		assert_eq!(System::refs(&ALICE), 1);
+		let alice_ref_count_1 = System::consumers(&ALICE);
+		assert_eq!(alice_ref_count_1, alice_ref_count_0 + 1);
 
 		// dot not manipulate balance
 		assert_eq!(Currencies::free_balance(BTC, &LoansModule::account_id()), 0);
@@ -111,7 +129,8 @@ fn update_loan_should_work() {
 		assert_eq!(<Positions<Runtime>>::contains_key(BTC, &ALICE), false);
 
 		// decrease ref count after remove position
-		assert_eq!(System::refs(&ALICE), 0);
+		let alice_ref_count_2 = System::consumers(&ALICE);
+		assert_eq!(alice_ref_count_2, alice_ref_count_1 - 1);
 	});
 }
 
@@ -132,7 +151,7 @@ fn transfer_loan_should_work() {
 		assert_eq!(LoansModule::positions(BTC, &BOB).debit, 1100);
 		assert_eq!(LoansModule::positions(BTC, &BOB).collateral, 500);
 
-		let transfer_loan_event = TestEvent::loans(RawEvent::TransferLoan(ALICE, BOB, BTC));
+		let transfer_loan_event = Event::loans(crate::Event::TransferLoan(ALICE, BOB, BTC));
 		assert!(System::events()
 			.iter()
 			.any(|record| record.event == transfer_loan_event));
@@ -164,7 +183,7 @@ fn confiscate_collateral_and_debit_work() {
 		assert_eq!(LoansModule::positions(BTC, &ALICE).debit, 100);
 		assert_eq!(LoansModule::positions(BTC, &ALICE).collateral, 200);
 
-		let confiscate_event = TestEvent::loans(RawEvent::ConfiscateCollateralAndDebit(ALICE, BTC, 300, 200));
+		let confiscate_event = Event::loans(crate::Event::ConfiscateCollateralAndDebit(ALICE, BTC, 300, 200));
 		assert!(System::events().iter().any(|record| record.event == confiscate_event));
 	});
 }

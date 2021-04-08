@@ -1,939 +1,1123 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! # DEX Module
 //!
 //! ## Overview
 //!
-//! Built-in decentralized exchange modules in Acala network, the core currency
-//! type of trading pairs is stable currency (aUSD), the trading mechanism
-//! refers to the design of Uniswap. In addition to being used for trading, DEX
-//! also participates in CDP liquidation, which is faster than liquidation by
-//! auction when the liquidity is sufficient. And providing market making
-//! liquidity for DEX will also receive stable currency as additional reward for
-//! its participation in the CDP liquidation.
+//! Built-in decentralized exchange modules in Acala network, the swap
+//! mechanism refers to the design of Uniswap V2. In addition to being used for
+//! trading, DEX also participates in CDP liquidation, which is faster than
+//! liquidation by auction when the liquidity is sufficient. And providing
+//! market making liquidity for DEX will also receive stable currency as
+//! additional reward for its participation in the CDP liquidation.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::unused_unit)]
+#![allow(clippy::collapsible_if)]
 
-use frame_support::{
-	decl_error, decl_event, decl_module, decl_storage, ensure,
-	traits::{EnsureOrigin, Get},
-	weights::{constants::WEIGHT_PER_MICROS, DispatchClass, Weight},
-	Parameter,
-};
-use frame_system::{self as system, ensure_signed};
+use frame_support::{log, pallet_prelude::*, transactional};
+use frame_system::pallet_prelude::*;
 use orml_traits::{MultiCurrency, MultiCurrencyExtended};
-use orml_utilities::with_transaction_result;
-use primitives::{Balance, CurrencyId};
+use primitives::{Balance, CurrencyId, TradingPair};
+use sp_core::U256;
 use sp_runtime::{
-	traits::{
-		AccountIdConversion, AtLeast32Bit, CheckedAdd, CheckedMul, CheckedSub, MaybeSerializeDeserialize, Member, One,
-		Saturating, UniqueSaturatedInto, Zero,
-	},
-	DispatchError, DispatchResult, FixedPointNumber, FixedPointOperand, ModuleId,
+	traits::{AccountIdConversion, UniqueSaturatedInto, Zero},
+	DispatchError, DispatchResult, FixedPointNumber, ModuleId, RuntimeDebug, SaturatedConversion,
 };
-use sp_std::prelude::Vec;
-use support::{CDPTreasury, DEXManager, EmergencyShutdown, Price, Rate, Ratio};
+use sp_std::{convert::TryInto, prelude::*, vec};
+use support::{DEXIncentives, DEXManager, Price, Ratio};
 
-mod benchmarking;
 mod mock;
 mod tests;
+pub mod weights;
 
-pub trait Trait: system::Trait {
-	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
+pub use module::*;
+pub use weights::WeightInfo;
 
-	/// Associate type for measuring liquidity contribution of specific trading
-	/// pairs
-	type Share: Parameter + Member + AtLeast32Bit + Default + Copy + MaybeSerializeDeserialize + FixedPointOperand;
-
-	/// The origin which may update parameters of dex. Root can always do this.
-	type UpdateOrigin: EnsureOrigin<Self::Origin>;
-
-	/// Currency for transfer currencies
-	type Currency: MultiCurrencyExtended<Self::AccountId, CurrencyId = CurrencyId, Balance = Balance>;
-
-	/// CDP treasury for depositing additional liquidity reward to DEX
-	type CDPTreasury: CDPTreasury<Self::AccountId, Balance = Balance, CurrencyId = CurrencyId>;
-
-	/// Allowed trading currency type list, each currency type forms a trading
-	/// pair with the base currency
-	type EnabledCurrencyIds: Get<Vec<CurrencyId>>;
-
-	/// The base currency as the core currency in all trading pairs
-	type GetBaseCurrencyId: Get<CurrencyId>;
-
-	/// Trading fee rate
-	type GetExchangeFee: Get<Rate>;
-
-	/// The DEX's module id, keep all assets in DEX.
-	type ModuleId: Get<ModuleId>;
-
-	/// Emergency shutdown.
-	type EmergencyShutdown: EmergencyShutdown;
+/// Parameters of TradingPair in Provisioning status
+#[derive(Encode, Decode, Clone, Copy, RuntimeDebug, PartialEq, Eq)]
+pub struct TradingPairProvisionParameters<Balance, BlockNumber> {
+	/// limit contribution per time.
+	min_contribution: (Balance, Balance),
+	/// target provision that trading pair could to be Enabled.
+	target_provision: (Balance, Balance),
+	/// accumulated provision amount for this Provisioning trading pair.
+	accumulated_provision: (Balance, Balance),
+	/// The number of block that status can be converted to Enabled.
+	not_before: BlockNumber,
 }
 
-decl_event!(
-	pub enum Event<T> where
-		<T as system::Trait>::AccountId,
-		<T as Trait>::Share,
-		Balance = Balance,
-		CurrencyId = CurrencyId,
-	{
-		/// Add liquidity success. [who, currency_type, added_currency_amount, added_base_currency_amount, increment_share_amount]
-		AddLiquidity(AccountId, CurrencyId, Balance, Balance, Share),
-		/// Withdraw liquidity from the trading pool success. [who, currency_type, withdrawn_currency_amount, withdrawn_base_currency_amount, burned_share_amount]
-		WithdrawLiquidity(AccountId, CurrencyId, Balance, Balance, Share),
-		/// Use supply currency to swap target currency. [trader, supply_currency_type, supply_currency_amount, target_currency_type, target_currency_amount]
-		Swap(AccountId, CurrencyId, Balance, CurrencyId, Balance),
-		/// Incentive reward rate updated. [currency_type, new_rate]
-		LiquidityIncentiveRateUpdated(CurrencyId, Rate),
-		/// Incentive interest claimed. [who, currency_type, amount]
-		IncentiveInterestClaimed(AccountId, CurrencyId, Balance),
-	}
-);
+/// Status for TradingPair
+#[derive(Clone, Copy, Encode, Decode, RuntimeDebug, PartialEq, Eq)]
+pub enum TradingPairStatus<Balance, BlockNumber> {
+	/// Default status,
+	/// can withdraw liquidity, re-enable and list this trading pair.
+	NotEnabled,
+	/// TradingPair is Provisioning,
+	/// can add provision and disable this trading pair.
+	Provisioning(TradingPairProvisionParameters<Balance, BlockNumber>),
+	/// TradingPair is Enabled,
+	/// can add/remove liquidity, trading and disable this trading pair.
+	Enabled,
+}
 
-decl_error! {
-	/// Error for dex module.
-	pub enum Error for Module<T: Trait> {
-		/// Not the tradable currency type
-		CurrencyIdNotAllowed,
-		/// Share amount is not enough
-		ShareNotEnough,
-		/// Share amount overflow
-		SharesOverflow,
-		/// The actual transaction price will be lower than the acceptable price
-		UnacceptablePrice,
-		/// The increment of liquidity is invalid
-		InvalidLiquidityIncrement,
+impl<Balance, BlockNumber> Default for TradingPairStatus<Balance, BlockNumber> {
+	fn default() -> Self {
+		Self::NotEnabled
 	}
 }
 
-decl_storage! {
-	trait Store for Module<T: Trait> as Dex {
-		/// Liquidity pool, which is the trading pair for specific currency type to base currency type.
-		/// CurrencyType -> (OtherCurrencyAmount, BaseCurrencyAmount)
-		LiquidityPool get(fn liquidity_pool): map hasher(twox_64_concat) CurrencyId => (Balance, Balance);
+#[frame_support::pallet]
+pub mod module {
+	use super::*;
 
-		/// Total shares amount of liquidity pool specified by currency type
-		/// CurrencyType -> TotalSharesAmount
-		TotalShares get(fn total_shares): map hasher(twox_64_concat) CurrencyId => T::Share;
+	#[pallet::config]
+	pub trait Config: frame_system::Config {
+		type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
 
-		/// Shares records indexed by currency type and account id
-		/// CurrencyType -> Owner -> ShareAmount
-		Shares get(fn shares): double_map hasher(twox_64_concat) CurrencyId, hasher(twox_64_concat) T::AccountId => T::Share;
-
-		/// Incentive reward rate for different currency type
-		/// CurrencyType -> IncentiveRate
-		LiquidityIncentiveRate get(fn liquidity_incentive_rate): map hasher(twox_64_concat) CurrencyId => Rate;
-
-		/// Total interest(include total withdrawn) and total withdrawn interest for different currency type
-		/// CurrencyType -> (TotalInterest, TotalWithdrawnInterest)
-		TotalInterest get(fn total_interest): map hasher(twox_64_concat) CurrencyId => (Balance, Balance);
-
-		/// Withdrawn interest indexed by currency type and account id
-		/// CurrencyType -> Owner -> WithdrawnInterest
-		WithdrawnInterest get(fn withdrawn_interest): double_map hasher(twox_64_concat) CurrencyId, hasher(twox_64_concat) T::AccountId => Balance;
-	}
-
-	add_extra_genesis {
-		config(liquidity_incentive_rate): Vec<(CurrencyId, Rate)>;
-		build(|config: &GenesisConfig| {
-			config.liquidity_incentive_rate.iter().for_each(| (currency_id, liquidity_incentive_rate) | {
-				LiquidityIncentiveRate::insert(currency_id, liquidity_incentive_rate);
-			});
-		});
-	}
-}
-
-decl_module! {
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-		type Error = Error<T>;
-
-		fn deposit_event() = default;
-
-		/// Tradable currency type list
-		const EnabledCurrencyIds: Vec<CurrencyId> = T::EnabledCurrencyIds::get();
-
-		/// Base currency type id
-		const GetBaseCurrencyId: CurrencyId = T::GetBaseCurrencyId::get();
+		/// Currency for transfer currencies
+		type Currency: MultiCurrencyExtended<Self::AccountId, CurrencyId = CurrencyId, Balance = Balance>;
 
 		/// Trading fee rate
-		const GetExchangeFee: Rate = T::GetExchangeFee::get();
+		/// The first item of the tuple is the numerator of the fee rate, second
+		/// item is the denominator, fee_rate = numerator / denominator,
+		/// use (u32, u32) over `Rate` type to minimize internal division
+		/// operation.
+		#[pallet::constant]
+		type GetExchangeFee: Get<(u32, u32)>;
+
+		/// The limit for length of trading path
+		#[pallet::constant]
+		type TradingPathLimit: Get<u32>;
 
 		/// The DEX's module id, keep all assets in DEX.
-		const ModuleId: ModuleId = T::ModuleId::get();
+		#[pallet::constant]
+		type ModuleId: Get<ModuleId>;
 
-		/// Update liquidity incentive rate of specific liquidity pool
+		/// Weight information for the extrinsics in this module.
+		type WeightInfo: WeightInfo;
+
+		/// DEX incentives
+		type DEXIncentives: DEXIncentives<Self::AccountId, CurrencyId, Balance>;
+
+		/// The origin which may list, enable or disable trading pairs.
+		type ListingOrigin: EnsureOrigin<Self::Origin>;
+	}
+
+	#[pallet::error]
+	pub enum Error<T> {
+		/// Trading pair is in NotEnabled status
+		NotEnabledTradingPair,
+		/// Trading pair must be in Enabled status
+		MustBeEnabled,
+		/// Trading pair must be in Provisioning status
+		MustBeProvisioning,
+		/// Trading pair must be in NotEnabled status
+		MustBeNotEnabled,
+		/// This trading pair is not allowed to be listed
+		NotAllowedList,
+		/// The increment of provision is invalid
+		InvalidContributionIncrement,
+		/// The increment of liquidity is invalid
+		InvalidLiquidityIncrement,
+		/// Invalid currency id
+		InvalidCurrencyId,
+		/// Invalid trading path length
+		InvalidTradingPathLength,
+		/// Target amount is less to min_target_amount
+		InsufficientTargetAmount,
+		/// Supply amount is more than max_supply_amount
+		ExcessiveSupplyAmount,
+		/// The swap will cause unacceptable price impact
+		ExceedPriceImpactLimit,
+		/// Liquidity is not enough
+		InsufficientLiquidity,
+		/// The supply amount is zero
+		ZeroSupplyAmount,
+		/// The target amount is zero
+		ZeroTargetAmount,
+	}
+
+	#[pallet::event]
+	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
+	pub enum Event<T: Config> {
+		/// add provision success \[who, currency_id_0, contribution_0,
+		/// currency_id_1, contribution_1\]
+		AddProvision(T::AccountId, CurrencyId, Balance, CurrencyId, Balance),
+		/// Add liquidity success. \[who, currency_id_0, pool_0_increment,
+		/// currency_id_1, pool_1_increment, share_increment\]
+		AddLiquidity(T::AccountId, CurrencyId, Balance, CurrencyId, Balance, Balance),
+		/// Remove liquidity from the trading pool success. \[who,
+		/// currency_id_0, pool_0_decrement, currency_id_1, pool_1_decrement,
+		/// share_decrement\]
+		RemoveLiquidity(T::AccountId, CurrencyId, Balance, CurrencyId, Balance, Balance),
+		/// Use supply currency to swap target currency. \[trader, trading_path,
+		/// supply_currency_amount, target_currency_amount\]
+		Swap(T::AccountId, Vec<CurrencyId>, Balance, Balance),
+		/// Enable trading pair. \[trading_pair\]
+		EnableTradingPair(TradingPair),
+		/// List trading pair. \[trading_pair\]
+		ListTradingPair(TradingPair),
+		/// Disable trading pair. \[trading_pair\]
+		DisableTradingPair(TradingPair),
+		/// Provisioning trading pair convert to Enabled. \[trading_pair,
+		/// pool_0_amount, pool_1_amount, total_share_amount\]
+		ProvisioningToEnabled(TradingPair, Balance, Balance, Balance),
+	}
+
+	/// Liquidity pool for TradingPair.
+	#[pallet::storage]
+	#[pallet::getter(fn liquidity_pool)]
+	pub type LiquidityPool<T: Config> = StorageMap<_, Twox64Concat, TradingPair, (Balance, Balance), ValueQuery>;
+
+	/// Status for TradingPair.
+	#[pallet::storage]
+	#[pallet::getter(fn trading_pair_statuses)]
+	pub type TradingPairStatuses<T: Config> =
+		StorageMap<_, Twox64Concat, TradingPair, TradingPairStatus<Balance, T::BlockNumber>, ValueQuery>;
+
+	/// Provision of TradingPair by AccountId.
+	#[pallet::storage]
+	#[pallet::getter(fn provisioning_pool)]
+	pub type ProvisioningPool<T: Config> =
+		StorageDoubleMap<_, Twox64Concat, TradingPair, Twox64Concat, T::AccountId, (Balance, Balance), ValueQuery>;
+
+	#[pallet::genesis_config]
+	pub struct GenesisConfig<T: Config> {
+		pub initial_listing_trading_pairs: Vec<(TradingPair, (Balance, Balance), (Balance, Balance), T::BlockNumber)>,
+		pub initial_enabled_trading_pairs: Vec<TradingPair>,
+		pub initial_added_liquidity_pools: Vec<(T::AccountId, Vec<(TradingPair, (Balance, Balance))>)>,
+	}
+
+	#[cfg(feature = "std")]
+	impl<T: Config> Default for GenesisConfig<T> {
+		fn default() -> Self {
+			GenesisConfig {
+				initial_listing_trading_pairs: vec![],
+				initial_enabled_trading_pairs: vec![],
+				initial_added_liquidity_pools: vec![],
+			}
+		}
+	}
+
+	#[pallet::genesis_build]
+	impl<T: Config> GenesisBuild<T> for GenesisConfig<T> {
+		fn build(&self) {
+			self.initial_listing_trading_pairs.iter().for_each(
+				|(trading_pair, min_contribution, target_provision, not_before)| {
+					assert!(
+						trading_pair.get_dex_share_currency_id().is_some(),
+						"the trading pair is invalid!",
+					);
+					TradingPairStatuses::<T>::insert(
+						trading_pair,
+						TradingPairStatus::Provisioning(TradingPairProvisionParameters {
+							min_contribution: *min_contribution,
+							target_provision: *target_provision,
+							accumulated_provision: Default::default(),
+							not_before: *not_before,
+						}),
+					);
+				},
+			);
+
+			self.initial_enabled_trading_pairs.iter().for_each(|trading_pair| {
+				assert!(
+					trading_pair.get_dex_share_currency_id().is_some(),
+					"the trading pair is invalid!",
+				);
+				TradingPairStatuses::<T>::insert(trading_pair, TradingPairStatus::<_, _>::Enabled);
+			});
+
+			self.initial_added_liquidity_pools
+				.iter()
+				.for_each(|(who, trading_pairs_data)| {
+					trading_pairs_data
+						.iter()
+						.for_each(|(trading_pair, (deposit_amount_0, deposit_amount_1))| {
+							assert!(
+								trading_pair.get_dex_share_currency_id().is_some(),
+								"the trading pair is invalid!",
+							);
+
+							let result = match <Pallet<T>>::trading_pair_statuses(trading_pair) {
+								TradingPairStatus::<_, _>::Enabled => <Pallet<T>>::do_add_liquidity(
+									&who,
+									trading_pair.0,
+									trading_pair.1,
+									*deposit_amount_0,
+									*deposit_amount_1,
+									false,
+								),
+								_ => Err(Error::<T>::NotEnabledTradingPair.into()),
+							};
+
+							assert!(result.is_ok(), "genesis add lidquidity pool failed.");
+						});
+				});
+		}
+	}
+
+	#[pallet::pallet]
+	pub struct Pallet<T>(PhantomData<T>);
+
+	#[pallet::hooks]
+	impl<T: Config> Hooks<T::BlockNumber> for Pallet<T> {}
+
+	#[pallet::call]
+	impl<T: Config> Pallet<T> {
+		/// Trading with DEX, swap with exact supply amount
 		///
-		/// The dispatch origin of this call must be `UpdateOrigin`.
-		///
-		/// - `currency_id`: currency type to determine the type of liquidity pool.
-		/// - `liquidity_incentive_rate`: liquidity incentive rate.
-		///
-		/// # <weight>
-		/// - Complexity: `O(1)`
-		/// - Db reads: 0
-		/// - Db writes: 1
-		/// -------------------
-		/// Base Weight: 24.92 µs
-		/// # </weight>
-		#[weight = (25 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(0, 1), DispatchClass::Operational)]
-		pub fn set_liquidity_incentive_rate(
-			origin,
-			currency_id: CurrencyId,
-			liquidity_incentive_rate: Rate,
-		) {
-			with_transaction_result(|| {
-				T::UpdateOrigin::ensure_origin(origin)?;
-				LiquidityIncentiveRate::insert(currency_id, liquidity_incentive_rate);
-				Self::deposit_event(RawEvent::LiquidityIncentiveRateUpdated(currency_id, liquidity_incentive_rate));
-				Ok(())
-			})?;
+		/// - `path`: trading path.
+		/// - `supply_amount`: exact supply amount.
+		/// - `min_target_amount`: acceptable minimum target amount.
+		#[pallet::weight(<T as Config>::WeightInfo::swap_with_exact_supply(path.len().try_into().unwrap()))]
+		#[transactional]
+		pub fn swap_with_exact_supply(
+			origin: OriginFor<T>,
+			path: Vec<CurrencyId>,
+			#[pallet::compact] supply_amount: Balance,
+			#[pallet::compact] min_target_amount: Balance,
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			let _ = Self::do_swap_with_exact_supply(&who, &path, supply_amount, min_target_amount, None)?;
+			Ok(().into())
 		}
 
-		/// Just withdraw liquidity incentive interest as the additional reward for liquidity contribution
+		/// Trading with DEX, swap with exact target amount
 		///
-		/// - `currency_id`: currency type to determine the type of liquidity pool.
-		///
-		/// # <weight>
-		/// - Preconditions:
-		/// 	- T::Currency is orml_currencies
-		///		- T::CDPTreasury is module_cdp_treasury
-		/// - Complexity: `O(1)`
-		/// - Db reads: 8
-		/// - Db writes: 4
-		/// -------------------
-		/// Base Weight: 143.4 µs
-		/// # </weight>
-		#[weight = 143 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(8, 4)]
-		pub fn withdraw_incentive_interest(origin, currency_id: CurrencyId) {
-			with_transaction_result(|| {
-				let who = ensure_signed(origin)?;
-				Self::claim_interest(currency_id, &who)?;
-				Ok(())
-			})?;
+		/// - `path`: trading path.
+		/// - `target_amount`: exact target amount.
+		/// - `max_supply_amount`: acceptable maxmum supply amount.
+		#[pallet::weight(<T as Config>::WeightInfo::swap_with_exact_target(path.len().try_into().unwrap()))]
+		#[transactional]
+		pub fn swap_with_exact_target(
+			origin: OriginFor<T>,
+			path: Vec<CurrencyId>,
+			#[pallet::compact] target_amount: Balance,
+			#[pallet::compact] max_supply_amount: Balance,
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			Self::do_swap_with_exact_target(&who, &path, target_amount, max_supply_amount, None)?;
+			Ok(().into())
 		}
 
-		/// Trading with DEX, swap supply currency to target currency
+		/// Add liquidity to Enabled trading pair, or add provision to
+		/// Provisioning trading pair.
+		/// - Add liquidity success will issue shares in current price which
+		///   decided by the liquidity scale. Shares are temporarily not
+		/// allowed to transfer and trade, it represents the proportion of
+		/// assets in liquidity pool.
+		/// - Add provision success will record the provision, issue shares to
+		///   caller in the initial price when trading pair convert to Enabled.
 		///
-		/// - `supply_currency_id`: supply currency type.
-		/// - `supply_amount`: supply currency amount.
-		/// - `target_currency_id`: target currency type.
-		/// - `acceptable_target_amount`: acceptable target amount, if actual amount is under it, swap will not happen
-		///
-		/// # <weight>
-		/// - Preconditions:
-		/// 	- T::Currency is orml_currencies
-		/// - Complexity: `O(1)`
-		/// - Db reads:
-		///		- swap base to other: 8
-		///		- swap other to base: 8
-		///		- swap other to other: 9
-		/// - Db writes:
-		///		- swap base to other: 5
-		///		- swap other to base: 5
-		///		- swap other to other: 6
-		/// -------------------
-		/// Base Weight:
-		///		- swap base to other: 192.1 µs
-		///		- swap other to base: 175.8 µs
-		///		- swap other to other: 199.7 µs
-		/// # </weight>
-		#[weight = 200 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(9, 6)]
-		pub fn swap_currency(
-			origin,
-			supply_currency_id: CurrencyId,
-			#[compact] supply_amount: Balance,
-			target_currency_id: CurrencyId,
-			#[compact] acceptable_target_amount: Balance,
-		) {
-			with_transaction_result(|| {
-				let who = ensure_signed(origin)?;
-				Self::do_exchange(&who, supply_currency_id, supply_amount, target_currency_id, acceptable_target_amount)?;
-				Ok(())
-			})?;
-		}
-
-		/// Injecting liquidity to specific liquidity pool in the form of depositing currencies in trading pairs
-		/// into liquidity pool, and issue shares in proportion to the caller. Shares are temporarily not
-		/// allowed to transfer and trade, it represents the proportion of assets in liquidity pool.
-		///
-		/// - `other_currency_id`: currency type to determine the type of liquidity pool.
-		/// - `max_other_currency_amount`: maximum currency amount allowed to inject to liquidity pool.
-		/// - `max_base_currency_amount`: maximum base currency(stable currency) amount allowed to inject to liquidity pool.
-		///
-		/// # <weight>
-		/// - Preconditions:
-		/// 	- T::Currency is orml_currencies
-		/// - Complexity: `O(1)`
-		/// - Db reads:
-		///		- best case: 9
-		///		- worst case: 10
-		/// - Db writes:
-		///		- best case: 7
-		///		- worst case: 9
-		/// -------------------
-		/// Base Weight:
-		///		- best case: 177.6 µs
-		///		- worst case: 205.7 µs
-		/// # </weight>
-		#[weight = 206 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(10, 9)]
+		/// - `currency_id_a`: currency id A.
+		/// - `currency_id_b`: currency id B.
+		/// - `max_amount_a`: maximum currency A amount allowed to inject to
+		///   liquidity pool.
+		/// - `max_amount_b`: maximum currency A amount allowed to inject to
+		///   liquidity pool.
+		/// - `deposit_increment_share`: this flag indicates whether to deposit
+		///   added lp shares to obtain incentives
+		#[pallet::weight(if *deposit_increment_share {
+			<T as Config>::WeightInfo::add_liquidity_and_deposit()
+		} else {
+			<T as Config>::WeightInfo::add_liquidity()
+		})]
+		#[transactional]
 		pub fn add_liquidity(
-			origin,
-			other_currency_id: CurrencyId,
-			#[compact] max_other_currency_amount: Balance,
-			#[compact] max_base_currency_amount: Balance,
-		) {
-			with_transaction_result(|| {
-				let who = ensure_signed(origin)?;
-				let base_currency_id = T::GetBaseCurrencyId::get();
-				ensure!(
-					T::EnabledCurrencyIds::get().contains(&other_currency_id),
-					Error::<T>::CurrencyIdNotAllowed,
-				);
+			origin: OriginFor<T>,
+			currency_id_a: CurrencyId,
+			currency_id_b: CurrencyId,
+			#[pallet::compact] max_amount_a: Balance,
+			#[pallet::compact] max_amount_b: Balance,
+			deposit_increment_share: bool,
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			let trading_pair = TradingPair::from_token_currency_ids(currency_id_a, currency_id_b)
+				.ok_or(Error::<T>::InvalidCurrencyId)?;
 
-				let total_shares = Self::total_shares(other_currency_id);
-				let (other_currency_increment, base_currency_increment, share_increment): (Balance, Balance, T::Share) =
-				if total_shares.is_zero() {
-					// initialize this liquidity pool, the initial share is equal to the max value between base currency amount and other currency amount
-					let initial_share: T::Share = sp_std::cmp::max(max_other_currency_amount, max_base_currency_amount).unique_saturated_into();
-
-					(max_other_currency_amount, max_base_currency_amount, initial_share)
-				} else {
-					let (other_currency_pool, base_currency_pool): (Balance, Balance) = Self::liquidity_pool(other_currency_id);
-					let other_base_price = Price::checked_from_rational(base_currency_pool, other_currency_pool).unwrap_or_default();
-					let input_other_base_price = Price::checked_from_rational(max_base_currency_amount, max_other_currency_amount).unwrap_or_default();
-
-					if input_other_base_price <= other_base_price {
-						// max_other_currency_amount may be too much, calculate the actual other currency amount
-						let base_other_price = Price::checked_from_rational(other_currency_pool, base_currency_pool).unwrap_or_default();
-						let other_currency_amount = base_other_price.saturating_mul_int(max_base_currency_amount);
-						let share = Ratio::checked_from_rational(other_currency_amount, other_currency_pool)
-							.and_then(|n| n.checked_mul_int(total_shares))
-							.unwrap_or_default();
-						(other_currency_amount, max_base_currency_amount, share)
-					} else {
-						// max_base_currency_amount is too much, calculate the actual base currency amount
-						let base_currency_amount = other_base_price.saturating_mul_int(max_other_currency_amount);
-						let share = Ratio::checked_from_rational(base_currency_amount, base_currency_pool)
-							.and_then(|n| n.checked_mul_int(total_shares))
-							.unwrap_or_default();
-						(max_other_currency_amount, base_currency_amount, share)
-					}
-				};
-
-				ensure!(
-					!share_increment.is_zero() && !other_currency_increment.is_zero() && !base_currency_increment.is_zero(),
-					Error::<T>::InvalidLiquidityIncrement,
-				);
-
-				T::Currency::transfer(other_currency_id, &who, &Self::account_id(), other_currency_increment)?;
-				T::Currency::transfer(base_currency_id, &who, &Self::account_id(), base_currency_increment)?;
-				Self::deposit_calculate_interest(other_currency_id, &who, share_increment);
-				<TotalShares<T>>::try_mutate(other_currency_id, |total_shares| -> DispatchResult {
-					*total_shares = total_shares.checked_add(&share_increment).ok_or(Error::<T>::SharesOverflow)?;
-					Ok(())
-				})?;
-				<Shares<T>>::mutate(other_currency_id, &who, |share|
-					*share = share.checked_add(&share_increment).expect("share cannot overflow if `total_shares` doesn't; qed")
-				);
-				LiquidityPool::mutate(other_currency_id, |(other, base)| {
-					*other = other.saturating_add(other_currency_increment);
-					*base = base.saturating_add(base_currency_increment);
-				});
-
-				Self::deposit_event(RawEvent::AddLiquidity(
-					who,
-					other_currency_id,
-					other_currency_increment,
-					base_currency_increment,
-					share_increment,
-				));
-				Ok(())
-			})?;
+			match Self::trading_pair_statuses(trading_pair) {
+				TradingPairStatus::<_, _>::Enabled => Self::do_add_liquidity(
+					&who,
+					currency_id_a,
+					currency_id_b,
+					max_amount_a,
+					max_amount_b,
+					deposit_increment_share,
+				),
+				TradingPairStatus::<_, _>::Provisioning(_) => {
+					Self::do_add_provision(&who, currency_id_a, currency_id_b, max_amount_a, max_amount_b)
+						.map(|_| Self::convert_to_enabled_if_possible(trading_pair))
+				}
+				TradingPairStatus::<_, _>::NotEnabled => Err(Error::<T>::NotEnabledTradingPair.into()),
+			}?;
+			Ok(().into())
 		}
 
-		/// Withdraw liquidity from specific liquidity pool in the form of burning shares, and withdrawing currencies in trading pairs
-		/// from liquidity pool in proportion, and withdraw liquidity incentive interest.
+		/// Remove liquidity from specific liquidity pool in the form of burning
+		/// shares, and withdrawing currencies in trading pairs from liquidity
+		/// pool in proportion, and withdraw liquidity incentive interest.
 		///
-		/// - `currency_id`: currency type to determine the type of liquidity pool.
-		/// - `share_amount`: share amount to burn.
-		///
-		/// # <weight>
-		/// - Preconditions:
-		/// 	- T::Currency is orml_currencies
-		/// - Complexity: `O(1)`
-		/// - Db reads: 11
-		/// - Db writes: 9
-		/// -------------------
-		/// Base Weight:
-		///		- best case: 240.1 µs
-		///		- worst case: 248.2 µs
-		/// # </weight>
-		#[weight = 248 * WEIGHT_PER_MICROS + T::DbWeight::get().reads_writes(11, 9)]
-		pub fn withdraw_liquidity(origin, currency_id: CurrencyId, #[compact] share_amount: T::Share) {
-			with_transaction_result(|| {
-				let who = ensure_signed(origin)?;
-				if share_amount.is_zero() { return Ok(()); }
-				ensure!(
-					T::EnabledCurrencyIds::get().contains(&currency_id),
-					Error::<T>::CurrencyIdNotAllowed,
-				);
-				let (other_currency_pool, base_currency_pool): (Balance, Balance) = Self::liquidity_pool(currency_id);
-				let proportion = Ratio::checked_from_rational(share_amount, Self::total_shares(currency_id)).unwrap_or_default();
-				let withdraw_other_currency_amount = proportion.saturating_mul_int(other_currency_pool);
-				let withdraw_base_currency_amount = proportion.saturating_mul_int(base_currency_pool);
-				T::Currency::transfer(currency_id, &Self::account_id(), &who, withdraw_other_currency_amount)?;
-				T::Currency::transfer(T::GetBaseCurrencyId::get(), &Self::account_id(), &who, withdraw_base_currency_amount)?;
-				Self::withdraw_calculate_interest(currency_id, &who, share_amount)?;
-				<Shares<T>>::try_mutate(currency_id, &who, |share| -> DispatchResult {
-					*share = share.checked_sub(&share_amount).ok_or(Error::<T>::ShareNotEnough)?;
-					Ok(())
-				})?;
-				<TotalShares<T>>::mutate(currency_id, |share|
-					*share = share.checked_sub(&share_amount).expect("total share cannot underflow if share doesn't; qed")
-				);
-				LiquidityPool::mutate(currency_id, |(other, base)| {
-					*other = other.saturating_sub(withdraw_other_currency_amount);
-					*base = base.saturating_sub(withdraw_base_currency_amount);
-				});
-
-				Self::deposit_event(RawEvent::WithdrawLiquidity(
-					who,
-					currency_id,
-					withdraw_other_currency_amount,
-					withdraw_base_currency_amount,
-					share_amount,
-				));
-				Ok(())
-			})?;
+		/// - `currency_id_a`: currency id A.
+		/// - `currency_id_b`: currency id B.
+		/// - `remove_share`: liquidity amount to remove.
+		/// - `by_withdraw`: this flag indicates whether to withdraw share which
+		///   is on incentives.
+		#[pallet::weight(if *by_withdraw {
+			<T as Config>::WeightInfo::remove_liquidity_by_withdraw()
+		} else {
+			<T as Config>::WeightInfo::remove_liquidity()
+		})]
+		#[transactional]
+		pub fn remove_liquidity(
+			origin: OriginFor<T>,
+			currency_id_a: CurrencyId,
+			currency_id_b: CurrencyId,
+			#[pallet::compact] remove_share: Balance,
+			by_withdraw: bool,
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			Self::do_remove_liquidity(&who, currency_id_a, currency_id_b, remove_share, by_withdraw)?;
+			Ok(().into())
 		}
 
-		/// Accumulate liquidity incentive interest to respective reward pool when block end
-		///
-		/// # <weight>
-		/// - Complexity: `O(N)` where `N` is the number of currency_ids
-		/// - Db reads: `IsShutdown`, `TotalInterest`, 2 items in cdp_treasury
-		///	- Db writes: `TotalInterest`, 2 items in cdp_treasury
-		/// - Db reads per currency_id: , `LiquidityPool`, `LiquidityIncentiveRate`
-		/// -------------------
-		/// Base Weight: 79.58 * N µs
-		/// # </weight>
-		fn on_initialize(_n: T::BlockNumber) -> Weight {
-			let mut consumed_weight = 0;
-			let mut add_weight = |reads, writes, weight| {
-				consumed_weight += T::DbWeight::get().reads_writes(reads, writes);
-				consumed_weight += weight;
+		/// List a new trading pair, trading pair will become Enabled status
+		/// after provision process.
+		#[pallet::weight((<T as Config>::WeightInfo::list_trading_pair(), DispatchClass::Operational))]
+		#[transactional]
+		pub fn list_trading_pair(
+			origin: OriginFor<T>,
+			currency_id_a: CurrencyId,
+			currency_id_b: CurrencyId,
+			min_contribution_a: Balance,
+			min_contribution_b: Balance,
+			target_provision_a: Balance,
+			target_provision_b: Balance,
+			not_before: T::BlockNumber,
+		) -> DispatchResultWithPostInfo {
+			T::ListingOrigin::ensure_origin(origin)?;
+
+			let trading_pair = TradingPair::from_token_currency_ids(currency_id_a, currency_id_b)
+				.ok_or(Error::<T>::InvalidCurrencyId)?;
+			let dex_share_currency_id = trading_pair
+				.get_dex_share_currency_id()
+				.ok_or(Error::<T>::InvalidCurrencyId)?;
+			ensure!(
+				matches!(
+					Self::trading_pair_statuses(trading_pair),
+					TradingPairStatus::<_, _>::NotEnabled
+				),
+				Error::<T>::MustBeNotEnabled
+			);
+			ensure!(
+				T::Currency::total_issuance(dex_share_currency_id).is_zero(),
+				Error::<T>::NotAllowedList
+			);
+
+			let (min_contribution, target_provision) = if currency_id_a == trading_pair.0 {
+				(
+					(min_contribution_a, min_contribution_b),
+					(target_provision_a, target_provision_b),
+				)
+			} else {
+				(
+					(min_contribution_b, min_contribution_a),
+					(target_provision_b, target_provision_a),
+				)
 			};
 
-			if !T::EmergencyShutdown::is_shutdown() {
-				add_weight(4, 3, 0);
-				let mut accumulated_interest: Balance = Zero::zero();
+			TradingPairStatuses::<T>::insert(
+				trading_pair,
+				TradingPairStatus::Provisioning(TradingPairProvisionParameters {
+					min_contribution,
+					target_provision,
+					accumulated_provision: Default::default(),
+					not_before,
+				}),
+			);
+			Self::deposit_event(Event::ListTradingPair(trading_pair));
+			Ok(().into())
+		}
 
-				// accumulate interest
-				for currency_id in T::EnabledCurrencyIds::get() {
-					let interest_to_issue = Self::accumulate_interest(currency_id);
-					accumulated_interest = accumulated_interest.saturating_add(interest_to_issue);
-					add_weight(2, 0, 80_000_000);
+		/// Enable a new trading pair(without the provision process),
+		/// or re-enable a disabled trading pair.
+		#[pallet::weight((<T as Config>::WeightInfo::enable_trading_pair(), DispatchClass::Operational))]
+		#[transactional]
+		pub fn enable_trading_pair(
+			origin: OriginFor<T>,
+			currency_id_a: CurrencyId,
+			currency_id_b: CurrencyId,
+		) -> DispatchResultWithPostInfo {
+			T::ListingOrigin::ensure_origin(origin)?;
+
+			let trading_pair = TradingPair::from_token_currency_ids(currency_id_a, currency_id_b)
+				.ok_or(Error::<T>::InvalidCurrencyId)?;
+			ensure!(
+				matches!(
+					Self::trading_pair_statuses(trading_pair),
+					TradingPairStatus::<_, _>::NotEnabled
+				),
+				Error::<T>::MustBeNotEnabled
+			);
+
+			TradingPairStatuses::<T>::insert(trading_pair, TradingPairStatus::Enabled);
+			Self::deposit_event(Event::EnableTradingPair(trading_pair));
+			Ok(().into())
+		}
+
+		#[pallet::weight((<T as Config>::WeightInfo::disable_trading_pair(), DispatchClass::Operational))]
+		#[transactional]
+		pub fn disable_trading_pair(
+			origin: OriginFor<T>,
+			currency_id_a: CurrencyId,
+			currency_id_b: CurrencyId,
+		) -> DispatchResultWithPostInfo {
+			T::ListingOrigin::ensure_origin(origin)?;
+			let trading_pair = TradingPair::from_token_currency_ids(currency_id_a, currency_id_b)
+				.ok_or(Error::<T>::InvalidCurrencyId)?;
+
+			match Self::trading_pair_statuses(trading_pair) {
+				// will disable Enabled trading_pair
+				TradingPairStatus::<_, _>::Enabled => {
+					TradingPairStatuses::<T>::insert(trading_pair, TradingPairStatus::NotEnabled);
+					Self::deposit_event(Event::DisableTradingPair(trading_pair));
 				}
+				// will disable Provisioning trading_pair
+				TradingPairStatus::<_, _>::Provisioning(_) => {
+					let module_account_id = Self::account_id();
 
-				// issue aUSD as interest, ignore result
-				let _ = T::CDPTreasury::issue_debit(&Self::account_id(), accumulated_interest, false);
-			}
+					// refund provision
+					for (who, contribution) in ProvisioningPool::<T>::drain_prefix(trading_pair) {
+						T::Currency::transfer(trading_pair.0, &module_account_id, &who, contribution.0)?;
+						T::Currency::transfer(trading_pair.1, &module_account_id, &who, contribution.1)?;
 
-			consumed_weight
+						// decrease ref count
+						frame_system::Pallet::<T>::dec_consumers(&who);
+					}
+
+					TradingPairStatuses::<T>::remove(trading_pair);
+					Self::deposit_event(Event::DisableTradingPair(trading_pair));
+				}
+				TradingPairStatus::<_, _>::NotEnabled => {
+					return Err(Error::<T>::NotEnabledTradingPair.into());
+				}
+			};
+			Ok(().into())
 		}
 	}
 }
 
-impl<T: Trait> Module<T> {
-	pub fn account_id() -> T::AccountId {
+impl<T: Config> Pallet<T> {
+	fn account_id() -> T::AccountId {
 		T::ModuleId::get().into_account()
 	}
 
-	fn calculate_swap_target_amount(
-		supply_pool: Balance,
-		target_pool: Balance,
-		supply_amount: Balance,
-		fee_rate: Rate,
-	) -> Balance {
-		if supply_amount.is_zero() {
-			Zero::zero()
-		} else {
-			// new_target_pool = supply_pool * target_pool / (supply_amount + supply_pool)
-			let new_target_pool = supply_pool
-				.checked_add(supply_amount)
-				.and_then(|n| Ratio::checked_from_rational(supply_pool, n))
-				.and_then(|n| n.checked_mul_int(target_pool))
-				.unwrap_or_default();
-
-			if new_target_pool.is_zero() {
-				Zero::zero()
-			} else {
-				// target_amount = (target_pool - new_target_pool) * (1 - fee_rate)
-				target_pool
-					.checked_sub(new_target_pool)
-					.and_then(|n| Rate::one().saturating_sub(fee_rate).checked_mul_int(n))
-					.unwrap_or_default()
-			}
-		}
-	}
-
-	/// Calculate how much supply token needed for swap specific target amount.
-	fn calculate_swap_supply_amount(
-		supply_pool: Balance,
-		target_pool: Balance,
-		target_amount: Balance,
-		fee_rate: Rate,
-	) -> Balance {
-		if target_amount.is_zero() {
-			Zero::zero()
-		} else {
-			// new_target_pool = target_pool - target_amount / (1 - fee_rate)
-			let new_target_pool = Rate::one()
-				.saturating_sub(fee_rate)
-				.reciprocal()
-				.and_then(|n| n.checked_add(&Ratio::from_inner(1))) // add 1 to result in order to correct the possible losses caused by remainder discarding in internal
-				// division calculation
-				.and_then(|n| n.checked_mul_int(target_amount))
-				// add 1 to result in order to correct the possible losses caused by remainder discarding in internal
-				// division calculation
-				.and_then(|n| n.checked_add(Balance::one()))
-				.and_then(|n| target_pool.checked_sub(n))
-				.unwrap_or_default();
-
-			if new_target_pool.is_zero() {
-				Zero::zero()
-			} else {
-				// supply_amount = target_pool * supply_pool / new_target_pool - supply_pool
-				Ratio::checked_from_rational(target_pool, new_target_pool)
-					.and_then(|n| n.checked_add(&Ratio::from_inner(1))) // add 1 to result in order to correct the possible losses caused by remainder discarding in
-					// internal division calculation
-					.and_then(|n| n.checked_mul_int(supply_pool))
-					.and_then(|n| n.checked_add(Balance::one())) // add 1 to result in order to correct the possible losses caused by remainder discarding in
-					// internal division calculation
-					.and_then(|n| n.checked_sub(supply_pool))
-					.unwrap_or_default()
-			}
-		}
-	}
-
-	// use other currency to swap base currency
-	fn swap_other_to_base(
-		who: &T::AccountId,
-		other_currency_id: CurrencyId,
-		other_currency_amount: Balance,
-		acceptable_base_currency_amount: Balance,
-	) -> sp_std::result::Result<Balance, DispatchError> {
-		// calculate the base currency amount can get
-		let base_currency_id = T::GetBaseCurrencyId::get();
-		let (other_currency_pool, base_currency_pool) = Self::liquidity_pool(other_currency_id);
-		let base_currency_amount = Self::calculate_swap_target_amount(
-			other_currency_pool,
-			base_currency_pool,
-			other_currency_amount,
-			T::GetExchangeFee::get(),
-		);
-
-		// ensure the amount can get is not 0 and >= minium acceptable
-		ensure!(
-			!base_currency_amount.is_zero() && base_currency_amount >= acceptable_base_currency_amount,
-			Error::<T>::UnacceptablePrice,
-		);
-
-		// transfer token between account and dex and update liquidity pool
-		T::Currency::transfer(other_currency_id, who, &Self::account_id(), other_currency_amount)?;
-		T::Currency::transfer(base_currency_id, &Self::account_id(), who, base_currency_amount)?;
-
-		LiquidityPool::mutate(other_currency_id, |(other, base)| {
-			*other = other.saturating_add(other_currency_amount);
-			*base = base.saturating_sub(base_currency_amount);
-		});
-
-		Ok(base_currency_amount)
-	}
-
-	// use base currency to swap other currency
-	fn swap_base_to_other(
-		who: &T::AccountId,
-		other_currency_id: CurrencyId,
-		base_currency_amount: Balance,
-		acceptable_other_currency_amount: Balance,
-	) -> sp_std::result::Result<Balance, DispatchError> {
-		let base_currency_id = T::GetBaseCurrencyId::get();
-		let (other_currency_pool, base_currency_pool) = Self::liquidity_pool(other_currency_id);
-		let other_currency_amount = Self::calculate_swap_target_amount(
-			base_currency_pool,
-			other_currency_pool,
-			base_currency_amount,
-			T::GetExchangeFee::get(),
-		);
-		ensure!(
-			!other_currency_amount.is_zero() && other_currency_amount >= acceptable_other_currency_amount,
-			Error::<T>::UnacceptablePrice,
-		);
-
-		T::Currency::transfer(base_currency_id, who, &Self::account_id(), base_currency_amount)?;
-		T::Currency::transfer(other_currency_id, &Self::account_id(), who, other_currency_amount)?;
-		LiquidityPool::mutate(other_currency_id, |(other, base)| {
-			*other = other.saturating_sub(other_currency_amount);
-			*base = base.saturating_add(base_currency_amount);
-		});
-
-		Ok(other_currency_amount)
-	}
-
-	// use other currency to swap another other currency
-	fn swap_other_to_other(
-		who: &T::AccountId,
-		supply_other_currency_id: CurrencyId,
-		supply_other_currency_amount: Balance,
-		target_other_currency_id: CurrencyId,
-		acceptable_target_other_currency_amount: Balance,
-	) -> sp_std::result::Result<Balance, DispatchError> {
-		let fee_rate = T::GetExchangeFee::get();
-		let (supply_other_currency_pool, supply_base_currency_pool) = Self::liquidity_pool(supply_other_currency_id);
-		let intermediate_base_currency_amount = Self::calculate_swap_target_amount(
-			supply_other_currency_pool,
-			supply_base_currency_pool,
-			supply_other_currency_amount,
-			fee_rate,
-		);
-		let (target_other_currency_pool, target_base_currency_pool) = Self::liquidity_pool(target_other_currency_id);
-		let target_other_currency_amount = Self::calculate_swap_target_amount(
-			target_base_currency_pool,
-			target_other_currency_pool,
-			intermediate_base_currency_amount,
-			fee_rate,
-		);
-		ensure!(
-			!target_other_currency_amount.is_zero()
-				&& target_other_currency_amount >= acceptable_target_other_currency_amount,
-			Error::<T>::UnacceptablePrice,
-		);
-
-		T::Currency::transfer(
-			supply_other_currency_id,
-			who,
-			&Self::account_id(),
-			supply_other_currency_amount,
-		)?;
-		T::Currency::transfer(
-			target_other_currency_id,
-			&Self::account_id(),
-			who,
-			target_other_currency_amount,
-		)?;
-
-		LiquidityPool::mutate(supply_other_currency_id, |(other, base)| {
-			*other = other.saturating_add(supply_other_currency_amount);
-			*base = base.saturating_sub(intermediate_base_currency_amount);
-		});
-		LiquidityPool::mutate(target_other_currency_id, |(other, base)| {
-			*other = other.saturating_sub(target_other_currency_amount);
-			*base = base.saturating_add(intermediate_base_currency_amount);
-		});
-
-		Ok(target_other_currency_amount)
-	}
-
-	fn do_exchange(
-		who: &T::AccountId,
-		supply_currency_id: CurrencyId,
-		supply_amount: Balance,
-		target_currency_id: CurrencyId,
-		acceptable_target_amount: Balance,
-	) -> sp_std::result::Result<Balance, DispatchError> {
-		let base_currency_id = T::GetBaseCurrencyId::get();
-		let allowed_currency_ids = T::EnabledCurrencyIds::get();
-
-		let target_turnover =
-			if target_currency_id == base_currency_id && allowed_currency_ids.contains(&supply_currency_id) {
-				Self::swap_other_to_base(who, supply_currency_id, supply_amount, acceptable_target_amount)
-			} else if supply_currency_id == base_currency_id && allowed_currency_ids.contains(&target_currency_id) {
-				Self::swap_base_to_other(who, target_currency_id, supply_amount, acceptable_target_amount)
-			} else if supply_currency_id != target_currency_id
-				&& allowed_currency_ids.contains(&supply_currency_id)
-				&& allowed_currency_ids.contains(&target_currency_id)
+	/// Access status of specific trading_pair,
+	/// if status is Provisioning and able to be `Enabled`, update it and
+	/// return `Enabled`
+	fn convert_to_enabled_if_possible(trading_pair: TradingPair) {
+		if let TradingPairStatus::<_, _>::Provisioning(provision_parameters) = Self::trading_pair_statuses(trading_pair)
+		{
+			// check if able to be converted to Enable status
+			if frame_system::Pallet::<T>::block_number() >= provision_parameters.not_before
+				&& !provision_parameters.accumulated_provision.0.is_zero()
+				&& !provision_parameters.accumulated_provision.1.is_zero()
+				&& (provision_parameters.accumulated_provision.0 >= provision_parameters.target_provision.0
+					|| provision_parameters.accumulated_provision.1 >= provision_parameters.target_provision.1)
 			{
-				Self::swap_other_to_other(
-					who,
-					supply_currency_id,
-					supply_amount,
-					target_currency_id,
-					acceptable_target_amount,
-				)
-			} else {
-				Err(Error::<T>::CurrencyIdNotAllowed.into())
-			}?;
+				let lp_share_currency_id = trading_pair.get_dex_share_currency_id().expect("shouldn't be invalid!");
+				let mut total_shares_issued: Balance = Default::default();
+				for (who, contribution) in ProvisioningPool::<T>::drain_prefix(trading_pair) {
+					let share_amount = if provision_parameters.accumulated_provision.0
+						> provision_parameters.accumulated_provision.1
+					{
+						let initial_price_1_in_0: Price = Price::checked_from_rational(
+							provision_parameters.accumulated_provision.0,
+							provision_parameters.accumulated_provision.1,
+						)
+						.unwrap_or_default();
+						initial_price_1_in_0
+							.saturating_mul_int(contribution.1)
+							.saturating_add(contribution.0)
+					} else {
+						let initial_price_0_in_1: Price = Price::checked_from_rational(
+							provision_parameters.accumulated_provision.1,
+							provision_parameters.accumulated_provision.0,
+						)
+						.unwrap_or_default();
+						initial_price_0_in_1
+							.saturating_mul_int(contribution.0)
+							.saturating_add(contribution.1)
+					};
 
-		Self::deposit_event(RawEvent::Swap(
-			who.clone(),
-			supply_currency_id,
-			supply_amount,
-			target_currency_id,
-			target_turnover,
-		));
+					// issue shares to contributor
+					if T::Currency::deposit(lp_share_currency_id, &who, share_amount).is_ok() {
+						total_shares_issued = total_shares_issued.saturating_add(share_amount);
+					}
 
-		Ok(target_turnover)
-	}
+					// decrease ref count
+					frame_system::Pallet::<T>::dec_consumers(&who);
+				}
 
-	// get the minimum amount of supply currency needed for the target currency
-	// amount return 0 means cannot exchange
-	pub fn get_supply_amount_needed(
-		supply_currency_id: CurrencyId,
-		target_currency_id: CurrencyId,
-		target_currency_amount: Balance,
-	) -> Balance {
-		let base_currency_id = T::GetBaseCurrencyId::get();
-		let fee_rate = T::GetExchangeFee::get();
-		if supply_currency_id == target_currency_id {
-			Zero::zero()
-		} else if target_currency_id == base_currency_id {
-			let (other_currency_pool, base_currency_pool) = Self::liquidity_pool(supply_currency_id);
-			Self::calculate_swap_supply_amount(
-				other_currency_pool,
-				base_currency_pool,
-				target_currency_amount,
-				fee_rate,
-			)
-		} else if supply_currency_id == base_currency_id {
-			let (other_currency_pool, base_currency_pool) = Self::liquidity_pool(target_currency_id);
-			Self::calculate_swap_supply_amount(
-				base_currency_pool,
-				other_currency_pool,
-				target_currency_amount,
-				fee_rate,
-			)
-		} else {
-			let (target_other_currency_pool, target_base_currency_pool) = Self::liquidity_pool(target_currency_id);
-			let intermediate_base_currency_amount = Self::calculate_swap_supply_amount(
-				target_base_currency_pool,
-				target_other_currency_pool,
-				target_currency_amount,
-				fee_rate,
-			);
-			let (supply_other_currency_pool, supply_base_currency_pool) = Self::liquidity_pool(supply_currency_id);
-			Self::calculate_swap_supply_amount(
-				supply_other_currency_pool,
-				supply_base_currency_pool,
-				intermediate_base_currency_amount,
-				fee_rate,
-			)
+				// inject provision to liquidity pool
+				LiquidityPool::<T>::mutate(trading_pair, |(pool_0, pool_1)| {
+					*pool_0 = pool_0.saturating_add(provision_parameters.accumulated_provision.0);
+					*pool_1 = pool_1.saturating_sub(provision_parameters.accumulated_provision.1);
+				});
+
+				// update trading_pair to Enabled status
+				TradingPairStatuses::<T>::insert(trading_pair, TradingPairStatus::<_, _>::Enabled);
+
+				Self::deposit_event(Event::ProvisioningToEnabled(
+					trading_pair,
+					provision_parameters.accumulated_provision.0,
+					provision_parameters.accumulated_provision.1,
+					total_shares_issued,
+				));
+			}
 		}
 	}
 
-	// get the maximum amount of target currency you can get for the supply currency
-	// amount return 0 means cannot exchange
-	pub fn get_target_amount_available(
-		supply_currency_id: CurrencyId,
-		target_currency_id: CurrencyId,
-		supply_currency_amount: Balance,
-	) -> Balance {
-		let base_currency_id = T::GetBaseCurrencyId::get();
-		let fee_rate = T::GetExchangeFee::get();
-		if supply_currency_id == target_currency_id {
-			Zero::zero()
-		} else if target_currency_id == base_currency_id {
-			let (other_currency_pool, base_currency_pool) = Self::liquidity_pool(supply_currency_id);
-			Self::calculate_swap_target_amount(
-				other_currency_pool,
-				base_currency_pool,
-				supply_currency_amount,
-				fee_rate,
-			)
-		} else if supply_currency_id == base_currency_id {
-			let (other_currency_pool, base_currency_pool) = Self::liquidity_pool(target_currency_id);
-			Self::calculate_swap_target_amount(
-				base_currency_pool,
-				other_currency_pool,
-				supply_currency_amount,
-				fee_rate,
-			)
-		} else {
-			let (supply_other_currency_pool, supply_base_currency_pool) = Self::liquidity_pool(supply_currency_id);
-			let intermediate_base_currency_amount = Self::calculate_swap_target_amount(
-				supply_other_currency_pool,
-				supply_base_currency_pool,
-				supply_currency_amount,
-				fee_rate,
-			);
-			let (target_other_currency_pool, target_base_currency_pool) = Self::liquidity_pool(target_currency_id);
-			Self::calculate_swap_target_amount(
-				target_base_currency_pool,
-				target_other_currency_pool,
-				intermediate_base_currency_amount,
-				fee_rate,
-			)
-		}
-	}
-
-	fn deposit_calculate_interest(currency_id: CurrencyId, who: &T::AccountId, share_amount: T::Share) {
-		let total_shares = Self::total_shares(currency_id);
-		let (total_interest, _) = Self::total_interest(currency_id);
-		if total_shares.is_zero() || total_interest.is_zero() {
-			return;
-		}
-
-		let proportion = Ratio::checked_from_rational(share_amount, total_shares).unwrap_or_default();
-		let interest_to_expand = proportion.saturating_mul_int(total_interest);
-		<WithdrawnInterest<T>>::mutate(currency_id, who, |val| {
-			*val = val.saturating_add(interest_to_expand);
-		});
-		TotalInterest::mutate(currency_id, |(total_interest, total_withdrawn)| {
-			*total_interest = total_interest.saturating_add(interest_to_expand);
-			*total_withdrawn = total_withdrawn.saturating_add(interest_to_expand);
-		});
-	}
-
-	fn withdraw_calculate_interest(
-		currency_id: CurrencyId,
+	/// Add provision to Provisioning TradingPair
+	fn do_add_provision(
 		who: &T::AccountId,
-		share_amount: T::Share,
+		currency_id_a: CurrencyId,
+		currency_id_b: CurrencyId,
+		contribution_a: Balance,
+		contribution_b: Balance,
 	) -> DispatchResult {
-		// claim interest first
-		Self::claim_interest(currency_id, who)?;
+		let trading_pair = TradingPair::new(currency_id_a, currency_id_b);
+		let mut provision_parameters = match Self::trading_pair_statuses(trading_pair) {
+			TradingPairStatus::<_, _>::Provisioning(provision_parameters) => provision_parameters,
+			_ => return Err(Error::<T>::MustBeProvisioning.into()),
+		};
+		let (contribution_0, contribution_1) = if currency_id_a == trading_pair.0 {
+			(contribution_a, contribution_b)
+		} else {
+			(contribution_b, contribution_a)
+		};
 
-		let proportion =
-			Ratio::checked_from_rational(share_amount, Self::total_shares(currency_id)).unwrap_or_default();
-		let withdrawn_interest_to_remove = Ratio::checked_from_rational(share_amount, Self::shares(currency_id, who))
-			.unwrap_or_default()
-			.saturating_mul_int(Self::withdrawn_interest(currency_id, who));
+		ensure!(
+			contribution_0 >= provision_parameters.min_contribution.0
+				|| contribution_1 >= provision_parameters.min_contribution.1,
+			Error::<T>::InvalidContributionIncrement
+		);
 
-		<WithdrawnInterest<T>>::mutate(currency_id, who, |val| {
-			*val = val.saturating_sub(withdrawn_interest_to_remove);
-		});
-		TotalInterest::mutate(currency_id, |(total_interest, total_withdrawn)| {
-			*total_interest = total_interest.saturating_sub(proportion.saturating_mul_int(*total_interest));
-			*total_withdrawn = total_withdrawn.saturating_sub(withdrawn_interest_to_remove);
-		});
+		ProvisioningPool::<T>::try_mutate_exists(trading_pair, &who, |maybe_pool| -> DispatchResult {
+			let existed = maybe_pool.is_some();
+			let mut pool = maybe_pool.unwrap_or_default();
+			pool.0 = pool.0.saturating_add(contribution_0);
+			pool.1 = pool.1.saturating_add(contribution_1);
 
-		Ok(())
-	}
+			let module_account_id = Self::account_id();
+			T::Currency::transfer(trading_pair.0, &who, &module_account_id, contribution_0)?;
+			T::Currency::transfer(trading_pair.1, &who, &module_account_id, contribution_1)?;
 
-	fn claim_interest(currency_id: CurrencyId, who: &T::AccountId) -> DispatchResult {
-		let proportion = Ratio::checked_from_rational(Self::shares(currency_id, who), Self::total_shares(currency_id))
-			.unwrap_or_default();
-		let interest_to_withdraw = proportion
-			.saturating_mul_int(Self::total_interest(currency_id).0)
-			.saturating_sub(Self::withdrawn_interest(currency_id, who));
+			*maybe_pool = Some(pool);
 
-		if !interest_to_withdraw.is_zero() {
-			// withdraw interest to share holder
-			T::Currency::transfer(
-				T::GetBaseCurrencyId::get(),
-				&Self::account_id(),
-				&who,
-				interest_to_withdraw,
-			)?;
-			<WithdrawnInterest<T>>::mutate(currency_id, who, |val| {
-				*val = val.saturating_add(interest_to_withdraw);
-			});
-			TotalInterest::mutate(currency_id, |(_, total_withdrawn)| {
-				*total_withdrawn = total_withdrawn.saturating_add(interest_to_withdraw);
-			});
+			if !existed && maybe_pool.is_some() {
+				if frame_system::Pallet::<T>::inc_consumers(&who).is_err() {
+					// No providers for the locks. This is impossible under normal circumstances
+					// since the funds that are under the lock will themselves be stored in the
+					// account and therefore will need a reference.
+					log::warn!(
+						"Warning: Attempt to introduce lock consumer reference, yet no providers. \
+						This is unexpected but should be safe."
+					);
+				}
+			}
 
-			Self::deposit_event(RawEvent::IncentiveInterestClaimed(
+			provision_parameters.accumulated_provision.0 = provision_parameters
+				.accumulated_provision
+				.0
+				.saturating_add(contribution_0);
+			provision_parameters.accumulated_provision.1 = provision_parameters
+				.accumulated_provision
+				.1
+				.saturating_add(contribution_1);
+
+			TradingPairStatuses::<T>::insert(
+				trading_pair,
+				TradingPairStatus::<_, _>::Provisioning(provision_parameters),
+			);
+
+			Self::deposit_event(Event::AddProvision(
 				who.clone(),
-				currency_id,
-				interest_to_withdraw,
+				trading_pair.0,
+				contribution_0,
+				trading_pair.1,
+				contribution_1,
 			));
-		}
-
-		Ok(())
+			Ok(())
+		})
 	}
 
-	fn accumulate_interest(currency_id: CurrencyId) -> Balance {
-		let (_, base_currency_pool) = Self::liquidity_pool(currency_id);
-		let interest_to_increase = Self::liquidity_incentive_rate(currency_id).saturating_mul_int(base_currency_pool);
+	fn do_add_liquidity(
+		who: &T::AccountId,
+		currency_id_a: CurrencyId,
+		currency_id_b: CurrencyId,
+		max_amount_a: Balance,
+		max_amount_b: Balance,
+		deposit_increment_share: bool,
+	) -> DispatchResult {
+		let trading_pair = TradingPair::new(currency_id_a, currency_id_b);
+		let lp_share_currency_id = trading_pair
+			.get_dex_share_currency_id()
+			.ok_or(Error::<T>::InvalidCurrencyId)?;
+		ensure!(
+			matches!(
+				Self::trading_pair_statuses(trading_pair),
+				TradingPairStatus::<_, _>::Enabled
+			),
+			Error::<T>::MustBeEnabled,
+		);
 
-		if !interest_to_increase.is_zero() {
-			TotalInterest::mutate(currency_id, |(total_interest, _)| {
-				*total_interest = total_interest.saturating_add(interest_to_increase);
-			});
+		LiquidityPool::<T>::try_mutate(trading_pair, |(pool_0, pool_1)| -> DispatchResult {
+			let total_shares = T::Currency::total_issuance(lp_share_currency_id);
+			let (max_amount_0, max_amount_1) = if currency_id_a == trading_pair.0 {
+				(max_amount_a, max_amount_b)
+			} else {
+				(max_amount_b, max_amount_a)
+			};
+			let (pool_0_increment, pool_1_increment, share_increment): (Balance, Balance, Balance) =
+				if total_shares.is_zero() {
+					let share_amount = if max_amount_0 > max_amount_1 {
+						let initial_price_1_in_0: Price =
+							Price::checked_from_rational(max_amount_0, max_amount_1).unwrap_or_default();
+						initial_price_1_in_0
+							.saturating_mul_int(max_amount_1)
+							.saturating_add(max_amount_0)
+					} else {
+						let initial_price_0_in_1: Price =
+							Price::checked_from_rational(max_amount_1, max_amount_0).unwrap_or_default();
+						initial_price_0_in_1
+							.saturating_mul_int(max_amount_0)
+							.saturating_add(max_amount_1)
+					};
+
+					(max_amount_0, max_amount_1, share_amount)
+				} else {
+					let price_0_1 = Price::checked_from_rational(*pool_1, *pool_0).unwrap_or_default();
+					let input_price_0_1 = Price::checked_from_rational(max_amount_1, max_amount_0).unwrap_or_default();
+
+					if input_price_0_1 <= price_0_1 {
+						// max_amount_0 may be too much, calculate the actual amount_0
+						let price_1_0 = Price::checked_from_rational(*pool_0, *pool_1).unwrap_or_default();
+						let amount_0 = price_1_0.saturating_mul_int(max_amount_1);
+						let share_increment = Ratio::checked_from_rational(amount_0, *pool_0)
+							.and_then(|n| n.checked_mul_int(total_shares))
+							.unwrap_or_default();
+						(amount_0, max_amount_1, share_increment)
+					} else {
+						// max_amount_1 is too much, calculate the actual amount_1
+						let amount_1 = price_0_1.saturating_mul_int(max_amount_0);
+						let share_increment = Ratio::checked_from_rational(amount_1, *pool_1)
+							.and_then(|n| n.checked_mul_int(total_shares))
+							.unwrap_or_default();
+						(max_amount_0, amount_1, share_increment)
+					}
+				};
+
+			ensure!(
+				!share_increment.is_zero() && !pool_0_increment.is_zero() && !pool_1_increment.is_zero(),
+				Error::<T>::InvalidLiquidityIncrement,
+			);
+
+			let module_account_id = Self::account_id();
+			T::Currency::transfer(trading_pair.0, who, &module_account_id, pool_0_increment)?;
+			T::Currency::transfer(trading_pair.1, who, &module_account_id, pool_1_increment)?;
+			T::Currency::deposit(lp_share_currency_id, who, share_increment)?;
+
+			*pool_0 = pool_0.saturating_add(pool_0_increment);
+			*pool_1 = pool_1.saturating_add(pool_1_increment);
+
+			if deposit_increment_share {
+				T::DEXIncentives::do_deposit_dex_share(who, lp_share_currency_id, share_increment)?;
+			}
+
+			Self::deposit_event(Event::AddLiquidity(
+				who.clone(),
+				trading_pair.0,
+				pool_0_increment,
+				trading_pair.1,
+				pool_1_increment,
+				share_increment,
+			));
+			Ok(())
+		})
+	}
+
+	#[transactional]
+	fn do_remove_liquidity(
+		who: &T::AccountId,
+		currency_id_a: CurrencyId,
+		currency_id_b: CurrencyId,
+		remove_share: Balance,
+		by_withdraw: bool,
+	) -> DispatchResult {
+		if remove_share.is_zero() {
+			return Ok(());
+		}
+		let trading_pair =
+			TradingPair::from_token_currency_ids(currency_id_a, currency_id_b).ok_or(Error::<T>::InvalidCurrencyId)?;
+		let lp_share_currency_id = trading_pair
+			.get_dex_share_currency_id()
+			.ok_or(Error::<T>::InvalidCurrencyId)?;
+
+		LiquidityPool::<T>::try_mutate(trading_pair, |(pool_0, pool_1)| -> DispatchResult {
+			let total_shares = T::Currency::total_issuance(lp_share_currency_id);
+			let proportion = Ratio::checked_from_rational(remove_share, total_shares).unwrap_or_default();
+			let pool_0_decrement = proportion.saturating_mul_int(*pool_0);
+			let pool_1_decrement = proportion.saturating_mul_int(*pool_1);
+			let module_account_id = Self::account_id();
+
+			if by_withdraw {
+				T::DEXIncentives::do_withdraw_dex_share(who, lp_share_currency_id, remove_share)?;
+			}
+			T::Currency::withdraw(lp_share_currency_id, &who, remove_share)?;
+			T::Currency::transfer(trading_pair.0, &module_account_id, &who, pool_0_decrement)?;
+			T::Currency::transfer(trading_pair.1, &module_account_id, &who, pool_1_decrement)?;
+
+			*pool_0 = pool_0.saturating_sub(pool_0_decrement);
+			*pool_1 = pool_1.saturating_sub(pool_1_decrement);
+
+			Self::deposit_event(Event::RemoveLiquidity(
+				who.clone(),
+				trading_pair.0,
+				pool_0_decrement,
+				trading_pair.1,
+				pool_1_decrement,
+				remove_share,
+			));
+			Ok(())
+		})
+	}
+
+	fn get_liquidity(currency_id_a: CurrencyId, currency_id_b: CurrencyId) -> (Balance, Balance) {
+		let trading_pair = TradingPair::new(currency_id_a, currency_id_b);
+		let (pool_0, pool_1) = Self::liquidity_pool(trading_pair);
+		if currency_id_a == trading_pair.0 {
+			(pool_0, pool_1)
+		} else {
+			(pool_1, pool_0)
+		}
+	}
+
+	/// Get how much target amount will be got for specific supply amount
+	/// and price impact
+	fn get_target_amount(supply_pool: Balance, target_pool: Balance, supply_amount: Balance) -> Balance {
+		if supply_amount.is_zero() || supply_pool.is_zero() || target_pool.is_zero() {
+			Zero::zero()
+		} else {
+			let (fee_numerator, fee_denominator) = T::GetExchangeFee::get();
+			let supply_amount_with_fee =
+				supply_amount.saturating_mul(fee_denominator.saturating_sub(fee_numerator).unique_saturated_into());
+			let numerator: U256 = U256::from(supply_amount_with_fee).saturating_mul(U256::from(target_pool));
+			let denominator: U256 = U256::from(supply_pool)
+				.saturating_mul(U256::from(fee_denominator))
+				.saturating_add(U256::from(supply_amount_with_fee));
+
+			numerator
+				.checked_div(denominator)
+				.and_then(|n| TryInto::<Balance>::try_into(n).ok())
+				.unwrap_or_else(Zero::zero)
+		}
+	}
+
+	/// Get how much supply amount will be paid for specific target amount.
+	fn get_supply_amount(supply_pool: Balance, target_pool: Balance, target_amount: Balance) -> Balance {
+		if target_amount.is_zero() || supply_pool.is_zero() || target_pool.is_zero() {
+			Zero::zero()
+		} else {
+			let (fee_numerator, fee_denominator) = T::GetExchangeFee::get();
+			let numerator: U256 = U256::from(supply_pool)
+				.saturating_mul(U256::from(target_amount))
+				.saturating_mul(U256::from(fee_denominator));
+			let denominator: U256 = U256::from(target_pool)
+				.saturating_sub(U256::from(target_amount))
+				.saturating_mul(U256::from(fee_denominator.saturating_sub(fee_numerator)));
+
+			numerator
+				.checked_div(denominator)
+				.and_then(|r| r.checked_add(U256::one())) // add 1 to result so that correct the possible losses caused by remainder discarding in
+				.and_then(|n| TryInto::<Balance>::try_into(n).ok())
+				.unwrap_or_else(Zero::zero)
+		}
+	}
+
+	fn get_target_amounts(
+		path: &[CurrencyId],
+		supply_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> sp_std::result::Result<Vec<Balance>, DispatchError> {
+		let path_length = path.len();
+		ensure!(
+			path_length >= 2 && path_length <= T::TradingPathLimit::get().saturated_into(),
+			Error::<T>::InvalidTradingPathLength
+		);
+		let mut target_amounts: Vec<Balance> = vec![Zero::zero(); path_length];
+		target_amounts[0] = supply_amount;
+
+		let mut i: usize = 0;
+		while i + 1 < path_length {
+			ensure!(
+				matches!(
+					Self::trading_pair_statuses(TradingPair::new(path[i], path[i + 1])),
+					TradingPairStatus::<_, _>::Enabled
+				),
+				Error::<T>::MustBeEnabled
+			);
+			let (supply_pool, target_pool) = Self::get_liquidity(path[i], path[i + 1]);
+			ensure!(
+				!supply_pool.is_zero() && !target_pool.is_zero(),
+				Error::<T>::InsufficientLiquidity
+			);
+			let target_amount = Self::get_target_amount(supply_pool, target_pool, target_amounts[i]);
+			ensure!(!target_amount.is_zero(), Error::<T>::ZeroTargetAmount);
+
+			// check price impact if limit exists
+			if let Some(limit) = price_impact_limit {
+				let price_impact = Ratio::checked_from_rational(target_amount, target_pool).unwrap_or_else(Ratio::zero);
+				ensure!(price_impact <= limit, Error::<T>::ExceedPriceImpactLimit);
+			}
+
+			target_amounts[i + 1] = target_amount;
+			i += 1;
 		}
 
-		interest_to_increase
+		Ok(target_amounts)
+	}
+
+	fn get_supply_amounts(
+		path: &[CurrencyId],
+		target_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> sp_std::result::Result<Vec<Balance>, DispatchError> {
+		let path_length = path.len();
+		ensure!(
+			path_length >= 2 && path_length <= T::TradingPathLimit::get().saturated_into(),
+			Error::<T>::InvalidTradingPathLength
+		);
+		let mut supply_amounts: Vec<Balance> = vec![Zero::zero(); path_length];
+		supply_amounts[path_length - 1] = target_amount;
+
+		let mut i: usize = path_length - 1;
+		while i > 0 {
+			ensure!(
+				matches!(
+					Self::trading_pair_statuses(TradingPair::new(path[i - 1], path[i])),
+					TradingPairStatus::<_, _>::Enabled
+				),
+				Error::<T>::MustBeEnabled
+			);
+			let (supply_pool, target_pool) = Self::get_liquidity(path[i - 1], path[i]);
+			ensure!(
+				!supply_pool.is_zero() && !target_pool.is_zero(),
+				Error::<T>::InsufficientLiquidity
+			);
+			let supply_amount = Self::get_supply_amount(supply_pool, target_pool, supply_amounts[i]);
+			ensure!(!supply_amount.is_zero(), Error::<T>::ZeroSupplyAmount);
+
+			// check price impact if limit exists
+			if let Some(limit) = price_impact_limit {
+				let price_impact =
+					Ratio::checked_from_rational(supply_amounts[i], target_pool).unwrap_or_else(Ratio::zero);
+				ensure!(price_impact <= limit, Error::<T>::ExceedPriceImpactLimit);
+			};
+
+			supply_amounts[i - 1] = supply_amount;
+			i -= 1;
+		}
+
+		Ok(supply_amounts)
+	}
+
+	fn _swap(
+		supply_currency_id: CurrencyId,
+		target_currency_id: CurrencyId,
+		supply_increment: Balance,
+		target_decrement: Balance,
+	) {
+		if let Some(trading_pair) = TradingPair::from_token_currency_ids(supply_currency_id, target_currency_id) {
+			LiquidityPool::<T>::mutate(trading_pair, |(pool_0, pool_1)| {
+				if supply_currency_id == trading_pair.0 {
+					*pool_0 = pool_0.saturating_add(supply_increment);
+					*pool_1 = pool_1.saturating_sub(target_decrement);
+				} else {
+					*pool_0 = pool_0.saturating_sub(target_decrement);
+					*pool_1 = pool_1.saturating_add(supply_increment);
+				}
+			});
+		}
+	}
+
+	fn _swap_by_path(path: &[CurrencyId], amounts: &[Balance]) {
+		let mut i: usize = 0;
+		while i + 1 < path.len() {
+			let (supply_currency_id, target_currency_id) = (path[i], path[i + 1]);
+			let (supply_increment, target_decrement) = (amounts[i], amounts[i + 1]);
+			Self::_swap(
+				supply_currency_id,
+				target_currency_id,
+				supply_increment,
+				target_decrement,
+			);
+			i += 1;
+		}
+	}
+
+	/// Ensured atomic.
+	#[transactional]
+	fn do_swap_with_exact_supply(
+		who: &T::AccountId,
+		path: &[CurrencyId],
+		supply_amount: Balance,
+		min_target_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> sp_std::result::Result<Balance, DispatchError> {
+		let amounts = Self::get_target_amounts(&path, supply_amount, price_impact_limit)?;
+		ensure!(
+			amounts[amounts.len() - 1] >= min_target_amount,
+			Error::<T>::InsufficientTargetAmount
+		);
+		let module_account_id = Self::account_id();
+		let actual_target_amount = amounts[amounts.len() - 1];
+
+		T::Currency::transfer(path[0], who, &module_account_id, supply_amount)?;
+		Self::_swap_by_path(&path, &amounts);
+		T::Currency::transfer(path[path.len() - 1], &module_account_id, who, actual_target_amount)?;
+
+		Self::deposit_event(Event::Swap(
+			who.clone(),
+			path.to_vec(),
+			supply_amount,
+			actual_target_amount,
+		));
+		Ok(actual_target_amount)
+	}
+
+	/// Ensured atomic.
+	#[transactional]
+	fn do_swap_with_exact_target(
+		who: &T::AccountId,
+		path: &[CurrencyId],
+		target_amount: Balance,
+		max_supply_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> sp_std::result::Result<Balance, DispatchError> {
+		let amounts = Self::get_supply_amounts(&path, target_amount, price_impact_limit)?;
+		ensure!(amounts[0] <= max_supply_amount, Error::<T>::ExcessiveSupplyAmount);
+		let module_account_id = Self::account_id();
+		let actual_supply_amount = amounts[0];
+
+		T::Currency::transfer(path[0], who, &module_account_id, actual_supply_amount)?;
+		Self::_swap_by_path(&path, &amounts);
+		T::Currency::transfer(path[path.len() - 1], &module_account_id, who, target_amount)?;
+
+		Self::deposit_event(Event::Swap(
+			who.clone(),
+			path.to_vec(),
+			actual_supply_amount,
+			target_amount,
+		));
+		Ok(actual_supply_amount)
 	}
 }
 
-impl<T: Trait> DEXManager<T::AccountId, CurrencyId, Balance> for Module<T> {
-	fn get_target_amount(
-		supply_currency_id: CurrencyId,
-		target_currency_id: CurrencyId,
-		supply_currency_amount: Balance,
-	) -> Balance {
-		Self::get_target_amount_available(supply_currency_id, target_currency_id, supply_currency_amount)
+impl<T: Config> DEXManager<T::AccountId, CurrencyId, Balance> for Pallet<T> {
+	fn get_liquidity_pool(currency_id_a: CurrencyId, currency_id_b: CurrencyId) -> (Balance, Balance) {
+		Self::get_liquidity(currency_id_a, currency_id_b)
 	}
 
-	fn get_supply_amount(
-		supply_currency_id: CurrencyId,
-		target_currency_id: CurrencyId,
-		target_currency_amount: Balance,
-	) -> Balance {
-		Self::get_supply_amount_needed(supply_currency_id, target_currency_id, target_currency_amount)
-	}
-
-	fn exchange_currency(
-		who: T::AccountId,
-		supply_currency_id: CurrencyId,
+	fn get_swap_target_amount(
+		path: &[CurrencyId],
 		supply_amount: Balance,
-		target_currency_id: CurrencyId,
-		acceptable_target_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> Option<Balance> {
+		Self::get_target_amounts(&path, supply_amount, price_impact_limit)
+			.ok()
+			.map(|amounts| amounts[amounts.len() - 1])
+	}
+
+	fn get_swap_supply_amount(
+		path: &[CurrencyId],
+		target_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> Option<Balance> {
+		Self::get_supply_amounts(&path, target_amount, price_impact_limit)
+			.ok()
+			.map(|amounts| amounts[0])
+	}
+
+	fn swap_with_exact_supply(
+		who: &T::AccountId,
+		path: &[CurrencyId],
+		supply_amount: Balance,
+		min_target_amount: Balance,
+		price_impact_limit: Option<Ratio>,
 	) -> sp_std::result::Result<Balance, DispatchError> {
-		Self::do_exchange(
-			&who,
-			supply_currency_id,
-			supply_amount,
-			target_currency_id,
-			acceptable_target_amount,
+		Self::do_swap_with_exact_supply(who, path, supply_amount, min_target_amount, price_impact_limit)
+	}
+
+	fn swap_with_exact_target(
+		who: &T::AccountId,
+		path: &[CurrencyId],
+		target_amount: Balance,
+		max_supply_amount: Balance,
+		price_impact_limit: Option<Ratio>,
+	) -> sp_std::result::Result<Balance, DispatchError> {
+		Self::do_swap_with_exact_target(who, path, target_amount, max_supply_amount, price_impact_limit)
+	}
+
+	// `do_add_liquidity` is used in genesis_build,
+	// but transactions are not supported by BasicExternalities,
+	// put `transactional` here
+	/// Ensured atomic.
+	#[transactional]
+	fn add_liquidity(
+		who: &T::AccountId,
+		currency_id_a: CurrencyId,
+		currency_id_b: CurrencyId,
+		max_amount_a: Balance,
+		max_amount_b: Balance,
+		deposit_increment_share: bool,
+	) -> DispatchResult {
+		Self::do_add_liquidity(
+			who,
+			currency_id_a,
+			currency_id_b,
+			max_amount_a,
+			max_amount_b,
+			deposit_increment_share,
 		)
 	}
 
-	// do not consider the fee rate
-	fn get_exchange_slippage(
-		supply_currency_id: CurrencyId,
-		target_currency_id: CurrencyId,
-		supply_amount: Balance,
-	) -> Option<Ratio> {
-		let base_currency_id = T::GetBaseCurrencyId::get();
-
-		if supply_currency_id == target_currency_id {
-			None
-		} else if supply_currency_id == base_currency_id {
-			let (_, base_currency_pool) = Self::liquidity_pool(target_currency_id);
-
-			// supply_amount / (supply_amount + base_currency_pool)
-			supply_amount
-				.checked_add(base_currency_pool)
-				.and_then(|n| Ratio::checked_from_rational(supply_amount, n))
-		} else if target_currency_id == base_currency_id {
-			let (other_currency_pool, _) = Self::liquidity_pool(supply_currency_id);
-
-			// supply_amount / (supply_amount + other_currency_pool)
-			supply_amount
-				.checked_add(other_currency_pool)
-				.and_then(|n| Ratio::checked_from_rational(supply_amount, n))
-		} else {
-			let (supply_other_currency_pool, supply_base_currency_pool) = Self::liquidity_pool(supply_currency_id);
-			let (_, target_base_currency_pool) = Self::liquidity_pool(target_currency_id);
-
-			// first slippage in swap supply other currency to base currency:
-			// first_slippage = supply_amount / (supply_amount + supply_other_currency_pool)
-			let supply_to_base_slippage = supply_amount
-				.checked_add(supply_other_currency_pool)
-				.and_then(|n| Ratio::checked_from_rational(supply_amount, n))?;
-
-			// second slippage in swap base currency to target other currency:
-			// base_amount = first_slippage * supply_base_currency_pool
-			// second_slippage = base_amount / (base_amount + target_base_currency_pool)
-			let base_amount = supply_to_base_slippage.saturating_mul_int(supply_base_currency_pool);
-			let base_to_target_slippage = base_amount
-				.checked_add(target_base_currency_pool)
-				.and_then(|n| Ratio::checked_from_rational(base_amount, n))?;
-
-			// final_slippage = first_slippage + (1 - first_slippage) * second_slippage
-			Ratio::one()
-				.checked_sub(&supply_to_base_slippage)
-				.and_then(|n| n.checked_mul(&base_to_target_slippage))
-				.and_then(|n| n.checked_add(&supply_to_base_slippage))
-		}
+	fn remove_liquidity(
+		who: &T::AccountId,
+		currency_id_a: CurrencyId,
+		currency_id_b: CurrencyId,
+		remove_share: Balance,
+		by_withdraw: bool,
+	) -> DispatchResult {
+		Self::do_remove_liquidity(who, currency_id_a, currency_id_b, remove_share, by_withdraw)
 	}
 }

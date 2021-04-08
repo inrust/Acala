@@ -1,19 +1,37 @@
+// This file is part of Acala.
+
+// Copyright (C) 2020-2021 Acala Foundation.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use frame_support::{decl_event, decl_module, decl_storage};
+use frame_support::{decl_event, decl_module, decl_storage, transactional};
 use frame_system::{self as system, ensure_root};
-use orml_utilities::with_transaction_result;
 use primitives::{AirDropCurrencyId, Balance};
+use sp_runtime::traits::StaticLookup;
 
 mod mock;
 mod tests;
 
-pub trait Trait: system::Trait {
-	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
+pub trait Config: system::Config {
+	type Event: From<Event<Self>> + Into<<Self as system::Config>::Event>;
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait> as AirDrop {
+	trait Store for Module<T: Config> as AirDrop {
 		AirDrops get(fn airdrops): double_map hasher(twox_64_concat) T::AccountId, hasher(twox_64_concat) AirDropCurrencyId => Balance;
 	}
 
@@ -30,51 +48,49 @@ decl_storage! {
 
 decl_event!(
 	pub enum Event<T> where
-		<T as system::Trait>::AccountId,
+		<T as system::Config>::AccountId,
 		AirDropCurrencyId = AirDropCurrencyId,
 		Balance = Balance,
 	{
-		/// [to, currency_id, amount]
+		/// \[to, currency_id, amount\]
 		Airdrop(AccountId, AirDropCurrencyId, Balance),
-		/// [to, currency_id, amount]
+		/// \[to, currency_id, amount\]
 		UpdateAirdrop(AccountId, AirDropCurrencyId, Balance),
 	}
 );
 
 decl_module! {
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
+	pub struct Module<T: Config> for enum Call where origin: T::Origin {
 		fn deposit_event() = default;
 
 		#[weight = 10_000]
+		#[transactional]
 		pub fn airdrop(
 			origin,
-			to: T::AccountId,
+			to: <T::Lookup as StaticLookup>::Source,
 			currency_id: AirDropCurrencyId,
 			amount: Balance,
 		) {
-			with_transaction_result(|| {
-				ensure_root(origin)?;
-				<AirDrops<T>>::mutate(&to, currency_id, |balance| *balance += amount);
-				Self::deposit_event(RawEvent::Airdrop(to, currency_id, amount));
-				Ok(())
-			})?;
+			ensure_root(origin)?;
+			let to = T::Lookup::lookup(to)?;
+			<AirDrops<T>>::mutate(&to, currency_id, |balance| *balance += amount);
+			Self::deposit_event(RawEvent::Airdrop(to, currency_id, amount));
 		}
 
 		#[weight = 10_000]
+		#[transactional]
 		pub fn update_airdrop(
 			origin,
-			to: T::AccountId,
+			to: <T::Lookup as StaticLookup>::Source,
 			currency_id: AirDropCurrencyId,
 			amount: Balance,
 		) {
-			with_transaction_result(|| {
-				ensure_root(origin)?;
-				<AirDrops<T>>::insert(&to, currency_id, amount);
-				Self::deposit_event(RawEvent::UpdateAirdrop(to, currency_id, amount));
-				Ok(())
-			})?;
+			ensure_root(origin)?;
+			let to = T::Lookup::lookup(to)?;
+			<AirDrops<T>>::insert(&to, currency_id, amount);
+			Self::deposit_event(RawEvent::UpdateAirdrop(to, currency_id, amount));
 		}
 	}
 }
 
-impl<T: Trait> Module<T> {}
+impl<T: Config> Pallet<T> {}
